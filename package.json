@@ -1,0 +1,18 @@
+{
+    "name": "monad-engine",
+    "version": "1.0.0",
+    "description": "Utilities for Monad farming bot - address derivation tools",
+    "scripts": {
+        "derive-address": "node derive_address.js"
+    },
+    "dependencies": {
+        "ethereumjs-util": "^7.1.5"
+    },
+    "keywords": [
+        "monad",
+        "ethereum",
+        "blockchain"
+    ],
+    "author": "",
+    "license": "MIT"
+}

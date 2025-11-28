@@ -1,0 +1,42 @@
+[package]
+name = "monad_engine"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "copy_trader"
+path = "src/bin/copy_trader.rs"
+
+[[bin]]
+name = "sniper_listener"
+path = "src/bin/sniper_listener.rs"
+
+[[bin]]
+name = "selector_calc"
+path = "src/bin/selector_calc.rs"
+
+[[bin]]
+name = "extract_selectors"
+path = "src/bin/extract_selectors.rs"
+[[bin]]
+name = "position_manager"
+path = "src/bin/position_manager.rs"
+
+[[bin]]
+name = "mempool_sniper"
+path = "src/bin/mempool_sniper.rs"
+
+[dependencies]
+alloy = { version = "0.8", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+dotenv = "0.15"
+anyhow = "1.0"
+url = "2.5"
+chrono = "0.4"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures = "0.3"
+hex = "0.4"
+dexscreener = "0.2"

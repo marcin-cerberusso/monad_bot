@@ -1,0 +1,33 @@
+   Compiling monad_engine v0.1.0 (/home/marcin/windsurf/copydevawwallet/solana-trading-bot/monad_engine)
+warning: unused import: `address`
+ --> src/bin/copy_trader.rs:6:18
+  |
+6 |     primitives::{address, U256, Address},
+  |                  ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused variable: `target_wallet_str`
+  --> src/bin/copy_trader.rs:99:9
+   |
+99 |     let target_wallet_str = env::var("TARGET_WALLET").context("Brak TARGET_WALLET")?;
+   |         ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_target_wallet_str`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: `monad_engine` (bin "copy_trader") generated 2 warnings (run `cargo fix --bin "copy_trader"` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 14.57s
+     Running `target/release/copy_trader`
+[2025-11-28 09:40:44] 🕵️  Odpalam Monad AUTO-SNIPER (v3.0 - Pro Strategy)...
+[2025-11-28 09:40:44] ⚙️  Config: Min = 5 MON, Max = 20 MON, Copy = 100%, Cooldown = 30s
+[2025-11-28 09:40:45] 🔗 Connected to Chain ID: 10143
+[2025-11-28 09:40:45] 👤 Bot Wallet: 0x7b2897ea9547a6bb3c147b3e262483ddab132a7d
+[2025-11-28 09:40:45] 🔗 Connected to Chain ID: 10143
+[2025-11-28 09:40:45] 👤 Bot Wallet: 0x7b2897ea9547a6bb3c147b3e262483ddab132a7d
+[2025-11-28 09:40:45] 📊 Loaded 0 positions, Stats: 0 trades, 0.00 MON P&L
+[2025-11-28 09:40:45] 🎯 Śledzę 3 portfeli:
+[2025-11-28 09:40:45]    - 0x69bb7c4e0f54350385c7d8cb2db2f52227d517a9
+[2025-11-28 09:40:45]    - 0x7db0b7f102d029cdca0001f85f8bfe487802424e
+[2025-11-28 09:40:45]    - 0x2e6db3f5efc88256e8271334ec0ec79e42e0a0df
+[2025-11-28 09:40:45] 👀 Nasłuchuję Routera Nad.fun: 0x6f6b8f1a20703309951a5127c45b49b1cd981a22
+[2025-11-28 09:40:45] ✅ Start od bloku: 52321855
