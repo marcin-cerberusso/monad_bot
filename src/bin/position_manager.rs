@@ -13,13 +13,15 @@ use url::Url;
 use anyhow::{Result, Context};
 use chrono::Local;
 use serde::{Serialize, Deserialize};
+use reqwest::Client;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 📉 POSITION MANAGER v3.0 - ROUTER PRICE CHECK + AUTO SELL
+// 📉 POSITION MANAGER v4.0 - MORALIS API + ROUTER FALLBACK
 // ═══════════════════════════════════════════════════════════════════════════════
-// - Sprawdza cenę przez Router (getAmountsOut)
+// - Sprawdza cenę przez Moralis API (primary)
+// - Fallback: Router getAmountsOut
 // - Trailing Stop Loss
-// - Hard Stop Loss
+// - Hard Stop Loss  
 // - Moonbag Secure
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -32,9 +34,6 @@ sol! {
         uint256 deadline;
     }
     function sell(SellParams params) external;
-    
-    // getAmountsOut - sprawdzenie ceny
-    function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts);
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -54,9 +53,16 @@ struct Position {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-struct Config {
+struct FullConfig {
+    api_keys: ApiKeys,
     settings: Settings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApiKeys {
+    moralis: String,
+    #[serde(default)]
+    gemini: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,17 +84,123 @@ impl Default for Settings {
     }
 }
 
-fn load_settings() -> Settings {
-    if let Ok(content) = fs::read_to_string("config.json") {
-        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(settings) = config.get("settings") {
-                if let Ok(s) = serde_json::from_value::<Settings>(settings.clone()) {
-                    return s;
+// ═══════════════════════════════════════════════════════════════════════════════
+// 🌐 MORALIS API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+struct MoralisTokenPrice {
+    #[serde(rename = "usdPrice")]
+    usd_price: Option<f64>,
+    #[serde(rename = "nativePrice")]
+    native_price: Option<NativePrice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativePrice {
+    value: String,
+    decimals: u32,
+}
+
+async fn get_moralis_price(
+    client: &Client,
+    token_address: &str,
+    api_key: &str,
+    chain: &str,
+) -> Option<f64> {
+    if api_key.is_empty() {
+        return None;
+    }
+    
+    // Moralis API endpoint for token price
+    let url = format!(
+        "https://deep-index.moralis.io/api/v2.2/erc20/{}/price?chain={}&include=percent_change",
+        token_address,
+        chain
+    );
+    
+    match client
+        .get(&url)
+        .header("X-API-Key", api_key)
+        .header("Accept", "application/json")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                if let Ok(data) = response.json::<MoralisTokenPrice>().await {
+                    return data.usd_price;
                 }
             }
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 📊 DEXSCREENER API (backup)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+struct DexScreenerResponse {
+    pairs: Option<Vec<DexPair>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DexPair {
+    #[serde(rename = "priceUsd")]
+    price_usd: Option<String>,
+    #[serde(rename = "priceNative")]
+    price_native: Option<String>,
+}
+
+async fn get_dexscreener_price(client: &Client, token_address: &str) -> Option<f64> {
+    let url = format!(
+        "https://api.dexscreener.com/latest/dex/tokens/{}",
+        token_address
+    );
+    
+    match client
+        .get(&url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if let Ok(data) = response.json::<DexScreenerResponse>().await {
+                if let Some(pairs) = data.pairs {
+                    if let Some(pair) = pairs.first() {
+                        if let Some(price_str) = &pair.price_native {
+                            return price_str.parse().ok();
+                        }
+                        if let Some(price_str) = &pair.price_usd {
+                            // Convert USD to MON (approx 1 MON = $0.03)
+                            if let Ok(usd) = price_str.parse::<f64>() {
+                                return Some(usd / 0.03);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 🔧 HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn load_config() -> (Settings, String) {
+    if let Ok(content) = fs::read_to_string("config.json") {
+        if let Ok(config) = serde_json::from_str::<FullConfig>(&content) {
+            return (config.settings, config.api_keys.moralis);
         }
     }
-    Settings::default()
+    (Settings::default(), String::new())
 }
 
 fn log(msg: &str) {
@@ -100,14 +212,25 @@ fn wei_to_mon(wei: U256) -> f64 {
     s.parse::<f64>().unwrap_or(0.0) / 1e18
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// 🚀 MAIN
+// ═══════════════════════════════════════════════════════════════════════════════
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
     log("╔═══════════════════════════════════════════════════════════════╗");
-    log("║  📉 POSITION MANAGER v3.0 - AUTO SELL 📉                      ║");
+    log("║  📉 POSITION MANAGER v4.0 - MORALIS + AUTO SELL 📉           ║");
     log("╚═══════════════════════════════════════════════════════════════╝");
 
-    let settings = load_settings();
+    let (settings, moralis_api_key) = load_config();
+    
+    if !moralis_api_key.is_empty() {
+        log("✅ Moralis API Key loaded");
+    } else {
+        log("⚠️  Moralis API Key missing - using Router fallback");
+    }
+    
     log(&format!("⚙️  Trailing: {}% | Hard SL: {}% | TP: {}%", 
         settings.trailing_stop_pct, settings.hard_stop_loss_pct, settings.take_profit_pct));
 
@@ -132,6 +255,11 @@ async fn main() -> Result<()> {
     log(&format!("👤 Wallet: {:?}", my_address));
     log(&format!("📍 Router: {:?}", router_address));
     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    let http_client = Client::new();
+    
+    // Monad chain ID for Moralis (check if supported)
+    let monad_chain = "0x279f"; // Monad testnet chain ID (10143 in hex)
 
     loop {
         let path = "positions.json";
@@ -161,7 +289,7 @@ async fn main() -> Result<()> {
                     // 1. Sprawdź balance tokena
                     let balance_selector = hex::decode("70a08231").unwrap();
                     let mut balance_data = balance_selector;
-                    balance_data.extend_from_slice(&[0u8; 12]); // padding
+                    balance_data.extend_from_slice(&[0u8; 12]);
                     balance_data.extend_from_slice(my_address.as_slice());
                     
                     let balance_req = TransactionRequest::default()
@@ -185,53 +313,59 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    let _balance_mon = wei_to_mon(current_balance);
+                    let balance_tokens = wei_to_mon(current_balance);
                     
-                    // 2. Sprawdź wartość przez Router getAmountsOut
-                    // path: [token, WMON]
-                    let amounts_selector = hex::decode("d06ca61f").unwrap(); // getAmountsOut
+                    // 2. Pobierz cenę - kolejność: Moralis -> DexScreener -> Router
+                    let mut token_price_mon: Option<f64> = None;
+                    let mut price_source = "unknown";
                     
-                    // Encode: getAmountsOut(uint256 amountIn, address[] path)
-                    let mut call_data = amounts_selector;
-                    // amountIn (32 bytes)
-                    call_data.extend_from_slice(&current_balance.to_be_bytes::<32>());
-                    // offset to path array (32 bytes) = 0x40 (64)
-                    call_data.extend_from_slice(&U256::from(64).to_be_bytes::<32>());
-                    // path array length (32 bytes) = 2
-                    call_data.extend_from_slice(&U256::from(2).to_be_bytes::<32>());
-                    // path[0] = token (32 bytes, left-padded)
-                    call_data.extend_from_slice(&[0u8; 12]);
-                    call_data.extend_from_slice(token_address.as_slice());
-                    // path[1] = WMON (32 bytes, left-padded)
-                    call_data.extend_from_slice(&[0u8; 12]);
-                    call_data.extend_from_slice(wmon_address.as_slice());
+                    // Try Moralis first
+                    if !moralis_api_key.is_empty() {
+                        if let Some(usd_price) = get_moralis_price(&http_client, &addr_str, &moralis_api_key, monad_chain).await {
+                            // Convert USD to MON value
+                            token_price_mon = Some(usd_price / 0.03 * balance_tokens);
+                            price_source = "Moralis";
+                        }
+                    }
                     
-                    let amounts_req = TransactionRequest::default()
-                        .to(router_address)
-                        .input(call_data.into());
+                    // Try DexScreener as backup
+                    if token_price_mon.is_none() {
+                        if let Some(native_price) = get_dexscreener_price(&http_client, &addr_str).await {
+                            token_price_mon = Some(native_price * balance_tokens);
+                            price_source = "DexScreener";
+                        }
+                    }
                     
-                    let current_value_mon = match provider.call(&amounts_req).await {
-                        Ok(bytes) => {
-                            // Response: uint256[] amounts
-                            // [offset (32)] [length (32)] [amount0 (32)] [amount1 (32)]
+                    // Try Router getAmountsOut as last resort
+                    if token_price_mon.is_none() {
+                        let amounts_selector = hex::decode("d06ca61f").unwrap();
+                        let mut call_data = amounts_selector;
+                        call_data.extend_from_slice(&current_balance.to_be_bytes::<32>());
+                        call_data.extend_from_slice(&U256::from(64).to_be_bytes::<32>());
+                        call_data.extend_from_slice(&U256::from(2).to_be_bytes::<32>());
+                        call_data.extend_from_slice(&[0u8; 12]);
+                        call_data.extend_from_slice(token_address.as_slice());
+                        call_data.extend_from_slice(&[0u8; 12]);
+                        call_data.extend_from_slice(wmon_address.as_slice());
+                        
+                        let amounts_req = TransactionRequest::default()
+                            .to(router_address)
+                            .input(call_data.into());
+                        
+                        if let Ok(bytes) = provider.call(&amounts_req).await {
                             if bytes.len() >= 128 {
                                 let amount_out = U256::from_be_slice(&bytes[96..128]);
-                                Some(wei_to_mon(amount_out))
+                                token_price_mon = Some(wei_to_mon(amount_out));
+                                price_source = "Router";
                             } else if bytes.len() >= 64 {
-                                // Some routers return just [amount0, amount1]
                                 let amount_out = U256::from_be_slice(&bytes[32..64]);
-                                Some(wei_to_mon(amount_out))
-                            } else {
-                                None
+                                token_price_mon = Some(wei_to_mon(amount_out));
+                                price_source = "Router";
                             }
                         }
-                        Err(e) => {
-                            log(&format!("   ⚠️ {} - Router error: {:?}", pos.token_name, e));
-                            None
-                        }
-                    };
+                    }
 
-                    if let Some(current_value) = current_value_mon {
+                    if let Some(current_value) = token_price_mon {
                         let entry = pos.entry_price_mon.max(pos.amount_mon);
                         
                         // Update highest value (ATH)
@@ -255,13 +389,14 @@ async fn main() -> Result<()> {
                             0.0
                         };
                         
-                        let emoji = if pnl_pct > 50.0 { "🔥" } 
+                        let emoji = if pnl_pct > 100.0 { "🔥🔥" }
+                                   else if pnl_pct > 50.0 { "🔥" } 
                                    else if pnl_pct > 0.0 { "📈" } 
                                    else if pnl_pct > -20.0 { "📉" } 
                                    else { "💀" };
                         
-                        log(&format!("   {} {} | {:.4} MON ({:+.1}%) | ATH drop: {:.1}%", 
-                            emoji, pos.token_name, current_value, pnl_pct, drop_from_ath));
+                        log(&format!("   {} {} | {:.4} MON ({:+.1}%) | ATH drop: {:.1}% [{}]", 
+                            emoji, pos.token_name, current_value, pnl_pct, drop_from_ath, price_source));
 
                         let mut should_sell = false;
                         let mut sell_reason = String::new();
@@ -273,7 +408,7 @@ async fn main() -> Result<()> {
                             sell_reason = format!("💀 HARD STOP LOSS ({:.1}% <= {}%)", pnl_pct, settings.hard_stop_loss_pct);
                         }
                         
-                        // 📉 TRAILING STOP
+                        // 📉 TRAILING STOP (aktywny po 50% zysku)
                         else if pnl_pct > 50.0 && drop_from_ath >= settings.trailing_stop_pct {
                             should_sell = true;
                             sell_reason = format!("📉 TRAILING STOP (drop {:.1}% >= {}%)", drop_from_ath, settings.trailing_stop_pct);
@@ -283,11 +418,9 @@ async fn main() -> Result<()> {
                         else if pnl_pct >= settings.take_profit_pct && !updated_pos.moonbag_secured {
                             should_sell = true;
                             sell_reason = format!("💰 MOONBAG SECURE ({:.1}% >= {}%)", pnl_pct, settings.take_profit_pct);
-                            // Sell only portion
-                            let sell_portion = (wei_to_mon(current_balance) * settings.moonbag_portion * 1e18) as u128;
+                            let sell_portion = (balance_tokens * settings.moonbag_portion * 1e18) as u128;
                             sell_amount = U256::from(sell_portion);
                             
-                            // Mark moonbag as secured
                             updated_pos.moonbag_secured = true;
                             positions.insert(addr_str.clone(), updated_pos);
                             save_needed = true;
@@ -318,7 +451,7 @@ async fn main() -> Result<()> {
                                 .to(router_address)
                                 .input(sell_call.abi_encode().into())
                                 .gas_limit(500_000)
-                                .max_priority_fee_per_gas(100_000_000_000); // 100 Gwei
+                                .max_priority_fee_per_gas(100_000_000_000);
                             
                             match provider.send_transaction(tx).await {
                                 Ok(pending) => {
@@ -327,7 +460,6 @@ async fn main() -> Result<()> {
                                         Ok(receipt) => {
                                             log(&format!("   ✅ SPRZEDANE! Hash: {:?}", receipt.transaction_hash));
                                             
-                                            // Remove position only if we sold everything
                                             if sell_amount == current_balance {
                                                 to_remove.push(addr_str.clone());
                                             }
@@ -338,6 +470,8 @@ async fn main() -> Result<()> {
                                 Err(e) => log(&format!("   ❌ TX error: {:?}", e)),
                             }
                         }
+                    } else {
+                        log(&format!("   ⚠️ {} - Nie mogę pobrać ceny (czekam...)", pos.token_name));
                     }
                 }
 
