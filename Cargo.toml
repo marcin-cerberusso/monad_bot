@@ -8,23 +8,40 @@ name = "copy_trader"
 path = "src/bin/copy_trader.rs"
 
 [[bin]]
-name = "sniper_listener"
-path = "src/bin/sniper_listener.rs"
-
-[[bin]]
-name = "selector_calc"
-path = "src/bin/selector_calc.rs"
-
-[[bin]]
-name = "extract_selectors"
-path = "src/bin/extract_selectors.rs"
-[[bin]]
 name = "position_manager"
 path = "src/bin/position_manager.rs"
 
 [[bin]]
 name = "mempool_sniper"
 path = "src/bin/mempool_sniper.rs"
+
+[[bin]]
+name = "ai_strategy_agent"
+path = "src/bin/ai_strategy_agent.rs"
+
+[[bin]]
+name = "take_profits"
+path = "src/bin/take_profits.rs"
+
+[[bin]]
+name = "trading_stats"
+path = "src/bin/trading_stats.rs"
+
+[[bin]]
+name = "sell_all"
+path = "src/bin/sell_all.rs"
+
+[[bin]]
+name = "portfolio_manager"
+path = "src/bin/portfolio_manager.rs"
+
+[[bin]]
+name = "strategy_engine"
+path = "src/bin/strategy_engine.rs"
+
+[[bin]]
+name = "whale_follower"
+path = "src/bin/whale_follower.rs"
 
 [dependencies]
 alloy = { version = "0.8", features = ["full"] }
@@ -40,3 +57,11 @@ serde_json = "1.0"
 futures = "0.3"
 hex = "0.4"
 dexscreener = "0.2"
+
+# Tracing / OpenTelemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
+tracing-opentelemetry = "0.22"
+opentelemetry = "0.21"
+opentelemetry_sdk = { version = "0.21", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.14", features = ["tonic"] }

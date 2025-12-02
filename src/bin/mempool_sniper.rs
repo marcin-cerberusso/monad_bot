@@ -1,33 +1,51 @@
 use alloy::{
-    providers::{Provider, ProviderBuilder},
-    primitives::{Address, U256, B256},
-    rpc::types::BlockTransactionsKind,
     consensus::Transaction as _,
     network::EthereumWallet,
+    primitives::{Address, B256, U256},
+    providers::{Provider, ProviderBuilder, WsConnect},
+    rpc::types::BlockTransactionsKind,
     signers::local::PrivateKeySigner,
     sol,
     sol_types::SolCall,
 };
-use std::{env, str::FromStr, time::{SystemTime, UNIX_EPOCH}, collections::{HashSet, HashMap}};
-use dotenv::dotenv;
 use anyhow::Result;
-use chrono::Local;
-use url::Url;
-use serde::{Deserialize, Serialize};
+use dotenv::dotenv;
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use futures::StreamExt;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
+
+// Tracing
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 🔥 GOD MODE v2: CREATOR ANALYSIS + DEXSCREENER + WHALE MODE 🔥
+// 🔥 GOD MODE v3: WEBSOCKETS + CREATOR ANALYSIS + DEXSCREENER 🔥
 // ═══════════════════════════════════════════════════════════════════════════════
-// Analizujemy TWÓRCĘ tokena, nie tylko nazwę!
-// - Historia creatora (ile tokenów stworzył)
-// - Czy poprzednie tokeny były udane
-// - Liquidity i volume z DexScreener
+// - WebSockets (wss://) dla minimalnego opóźnienia
+// - Analiza Twórcy (Creator Reputation)
+// - DexScreener Check
+// - Whale Mode (Dynamic Amount)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// NAD.FUN v3 BondingCurveRouter - buy function with BuyParams struct
 sol! {
     #[derive(Debug)]
-    function buy(uint256 tokenId, address tokenAddress, address recipient, uint256 deadline) external payable;
+    struct BuyParams {
+        uint256 amountOutMin;
+        address token;
+        address to;
+        uint256 deadline;
+    }
+
+    #[derive(Debug)]
+    function buy(BuyParams params) external payable;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -43,31 +61,17 @@ struct DexScreenerResponse {
 struct DexPair {
     #[serde(rename = "chainId")]
     chain_id: Option<String>,
-    #[serde(rename = "baseToken")]
-    base_token: Option<DexToken>,
-    #[serde(rename = "priceUsd")]
-    price_usd: Option<String>,
-    #[serde(rename = "priceChange")]
-    price_change: Option<PriceChange>,
     liquidity: Option<Liquidity>,
     volume: Option<Volume>,
     #[serde(rename = "txns")]
     transactions: Option<Transactions>,
-    #[serde(rename = "pairCreatedAt")]
-    pair_created_at: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DexToken {
-    address: Option<String>,
-    name: Option<String>,
-    symbol: Option<String>,
+    #[serde(rename = "priceChange")]
+    price_change: Option<PriceChange>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PriceChange {
     h1: Option<f64>,
-    h24: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,11 +102,8 @@ struct TxCount {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct CreatorStats {
     tokens_created: u32,
-    successful_tokens: u32,  // Tokens that pumped >2x
-    rugged_tokens: u32,      // Tokens that dumped >90%
-    total_volume_usd: f64,
-    avg_liquidity_usd: f64,
-    reputation_score: u8,    // 0-100
+    successful_tokens: u32,
+    rugged_tokens: u32,
 }
 
 fn load_creator_db() -> HashMap<String, CreatorStats> {
@@ -120,18 +121,147 @@ fn save_creator_db(db: &HashMap<String, CreatorStats>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// 🌐 GECKOTERMINAL API - TRENDING & SOCIAL SIGNALS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+struct GeckoResponse {
+    data: Option<Vec<GeckoPool>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeckoPool {
+    id: Option<String>,
+    attributes: Option<GeckoAttributes>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeckoAttributes {
+    name: Option<String>,
+    #[serde(rename = "base_token_price_usd")]
+    price_usd: Option<String>,
+    #[serde(rename = "volume_usd")]
+    volume: Option<GeckoVolume>,
+    #[serde(rename = "price_change_percentage")]
+    price_change: Option<GeckoPriceChange>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeckoVolume {
+    h24: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeckoPriceChange {
+    h1: Option<String>,
+    h24: Option<String>,
+}
+
+/// Check if token is in GeckoTerminal trending pools (social signal!)
+async fn is_token_trending(client: &Client, token_address: &str) -> (bool, i8) {
+    // Returns: (is_trending, bonus_score)
+    let token_lower = token_address.to_lowercase();
+
+    // Check trending pools
+    let url = "https://api.geckoterminal.com/api/v2/networks/monad/trending_pools";
+    if let Ok(resp) = client.get(url).send().await {
+        if let Ok(data) = resp.json::<GeckoResponse>().await {
+            if let Some(pools) = data.data {
+                for (i, pool) in pools.iter().enumerate() {
+                    if let Some(id) = &pool.id {
+                        if id.to_lowercase().contains(&token_lower) {
+                            let bonus = match i {
+                                0 => 25,     // #1 trending = huge bonus
+                                1..=2 => 20, // Top 3
+                                3..=4 => 15, // Top 5
+                                5..=9 => 10, // Top 10
+                                _ => 5,      // In trending at all
+                            };
+                            info!(position = i + 1, bonus, "🔥 TOKEN IS TRENDING!");
+                            return (true, bonus);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check new pools (recently created = potential)
+    let url = "https://api.geckoterminal.com/api/v2/networks/monad/new_pools";
+    if let Ok(resp) = client.get(url).send().await {
+        if let Ok(data) = resp.json::<GeckoResponse>().await {
+            if let Some(pools) = data.data {
+                for pool in pools.iter().take(10) {
+                    if let Some(id) = &pool.id {
+                        if id.to_lowercase().contains(&token_lower) {
+                            info!("✨ Token in NEW POOLS - fresh opportunity!");
+                            return (true, 8); // Small bonus for being new
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (false, 0)
+}
+
+/// Get overall market sentiment from top trending pools
+async fn get_market_sentiment(client: &Client) -> (String, i8) {
+    // Returns: (sentiment_text, score_modifier)
+    let url = "https://api.geckoterminal.com/api/v2/networks/monad/trending_pools";
+
+    if let Ok(resp) = client.get(url).send().await {
+        if let Ok(data) = resp.json::<GeckoResponse>().await {
+            if let Some(pools) = data.data {
+                let mut bullish = 0;
+                let mut bearish = 0;
+
+                for pool in pools.iter().take(10) {
+                    if let Some(attr) = &pool.attributes {
+                        if let Some(pc) = &attr.price_change {
+                            if let Some(h1) = &pc.h1 {
+                                if let Ok(change) = h1.parse::<f64>() {
+                                    if change > 5.0 {
+                                        bullish += 1;
+                                    } else if change < -5.0 {
+                                        bearish += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if bullish > bearish * 2 {
+                    return ("🟢 BULLISH MARKET".to_string(), 10);
+                } else if bearish > bullish * 2 {
+                    return ("🔴 BEARISH MARKET".to_string(), -15);
+                } else {
+                    return ("🟡 NEUTRAL".to_string(), 0);
+                }
+            }
+        }
+    }
+
+    ("⚪ UNKNOWN".to_string(), 0)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // 🔍 DEXSCREENER API
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async fn get_token_info(client: &Client, token_address: &str) -> Option<DexPair> {
-    let url = format!("https://api.dexscreener.com/latest/dex/tokens/{}", token_address);
-    
+    let url = format!(
+        "https://api.dexscreener.com/latest/dex/tokens/{}",
+        token_address
+    );
     match client.get(&url).send().await {
         Ok(resp) => {
             if let Ok(data) = resp.json::<DexScreenerResponse>().await {
                 if let Some(pairs) = data.pairs {
-                    // Return the pair with highest liquidity
-                    return pairs.into_iter()
+                    return pairs
+                        .into_iter()
                         .filter(|p| p.chain_id.as_deref() == Some("monad"))
                         .max_by(|a, b| {
                             let liq_a = a.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0);
@@ -141,117 +271,178 @@ async fn get_token_info(client: &Client, token_address: &str) -> Option<DexPair>
                 }
             }
         }
-        Err(e) => print_log(&format!("❌ DexScreener Error: {:?}", e)),
+        Err(e) => warn!(?e, "❌ DexScreener Error"),
     }
     None
 }
 
-async fn analyze_token_quality(client: &Client, token_address: &str) -> (u8, String) {
+async fn analyze_token_quality(client: &Client, token_address: &str) -> (u8, f64, f64, String) {
+    // Returns: (score, liquidity_usd, price_change_1h, reason_string)
+
+    // 1. Check social signals FIRST (trending = big bonus!)
+    let (is_trending, trending_bonus) = is_token_trending(client, token_address).await;
+
+    // 2. Check market sentiment
+    let (market_sentiment, market_modifier) = get_market_sentiment(client).await;
+
     if let Some(pair) = get_token_info(client, token_address).await {
         let liquidity = pair.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0);
         let volume_24h = pair.volume.as_ref().and_then(|v| v.h24).unwrap_or(0.0);
         let price_change_1h = pair.price_change.as_ref().and_then(|p| p.h1).unwrap_or(0.0);
-        let buys = pair.transactions.as_ref().and_then(|t| t.h24.as_ref()).and_then(|t| t.buys).unwrap_or(0);
-        let sells = pair.transactions.as_ref().and_then(|t| t.h24.as_ref()).and_then(|t| t.sells).unwrap_or(0);
-        
+        let buys = pair
+            .transactions
+            .as_ref()
+            .and_then(|t| t.h24.as_ref())
+            .and_then(|t| t.buys)
+            .unwrap_or(0);
+        let sells = pair
+            .transactions
+            .as_ref()
+            .and_then(|t| t.h24.as_ref())
+            .and_then(|t| t.sells)
+            .unwrap_or(1);
+
         let mut score = 50u8;
         let mut reasons = Vec::new();
-        
-        // Liquidity score
-        if liquidity > 100000.0 {
-            score = score.saturating_add(20);
-            reasons.push(format!("High liq ${:.0}k", liquidity/1000.0));
-        } else if liquidity > 10000.0 {
-            score = score.saturating_add(10);
-            reasons.push(format!("Good liq ${:.0}k", liquidity/1000.0));
-        } else if liquidity < 1000.0 {
-            score = score.saturating_sub(20);
-            reasons.push("Low liq".to_string());
-        }
-        
-        // Volume score
-        if volume_24h > 50000.0 {
-            score = score.saturating_add(15);
-            reasons.push(format!("High vol ${:.0}k", volume_24h/1000.0));
-        }
-        
-        // Buy/Sell ratio
-        if buys > 0 && sells > 0 {
-            let ratio = buys as f64 / sells as f64;
-            if ratio > 2.0 {
-                score = score.saturating_add(10);
-                reasons.push(format!("Bullish {:.1}x buys", ratio));
-            } else if ratio < 0.5 {
-                score = score.saturating_sub(15);
-                reasons.push("Bearish sells".to_string());
-            }
-        }
-        
-        // Price momentum
-        if price_change_1h > 50.0 {
-            score = score.saturating_add(10);
-            reasons.push(format!("+{:.0}% 1h", price_change_1h));
-        } else if price_change_1h < -30.0 {
+
+        // Liquidity scoring
+        if liquidity > 10000.0 {
+            score += 15;
+            reasons.push(format!("🌊 Liq ${:.0}k", liquidity / 1000.0));
+        } else if liquidity > 5000.0 {
+            score += 10;
+            reasons.push(format!("💧 Liq ${:.0}k", liquidity / 1000.0));
+        } else if liquidity > 1000.0 {
+            score += 5;
+            reasons.push(format!("💦 Liq ${:.0}", liquidity));
+        } else if liquidity > 0.0 {
             score = score.saturating_sub(10);
-            reasons.push(format!("{:.0}% 1h dump", price_change_1h));
+            reasons.push("⚠️ Low liq".to_string());
         }
-        
-        return (score.min(100), reasons.join(" | "));
+
+        // Volume scoring
+        if volume_24h > 50000.0 {
+            score += 15;
+            reasons.push(format!("📈 Vol ${:.0}k", volume_24h / 1000.0));
+        } else if volume_24h > 10000.0 {
+            score += 8;
+            reasons.push(format!("📊 Vol ${:.0}k", volume_24h / 1000.0));
+        }
+
+        // Buy/sell ratio
+        let ratio = buys as f64 / sells.max(1) as f64;
+        if ratio > 3.0 {
+            score += 15;
+            reasons.push(format!("🔥 {:.1}x buyers", ratio));
+        } else if ratio > 1.5 {
+            score += 8;
+            reasons.push(format!("📗 {:.1}x buyers", ratio));
+        } else if ratio < 0.5 {
+            score = score.saturating_sub(15);
+            reasons.push("📕 Heavy selling".to_string());
+        }
+
+        // Price change penalty (already pumped)
+        if price_change_1h > 100.0 {
+            score = score.saturating_sub(20);
+            reasons.push(format!("🚨 +{:.0}% pumped!", price_change_1h));
+        } else if price_change_1h > 50.0 {
+            score = score.saturating_sub(10);
+            reasons.push(format!("⚠️ +{:.0}% pump", price_change_1h));
+        } else if price_change_1h < -30.0 {
+            score = score.saturating_sub(15);
+            reasons.push(format!("🔻 {:.0}% dump", price_change_1h));
+        }
+
+        // 🌐 SOCIAL SIGNALS - trending bonus!
+        if is_trending {
+            score = score.saturating_add(trending_bonus as u8);
+            reasons.push(format!("🔥 TRENDING +{}", trending_bonus));
+        }
+
+        // 📊 Market sentiment modifier
+        if market_modifier != 0 {
+            if market_modifier > 0 {
+                score = score.saturating_add(market_modifier as u8);
+            } else {
+                score = score.saturating_sub((-market_modifier) as u8);
+            }
+            reasons.push(market_sentiment.clone());
+        }
+
+        return (
+            score.min(100),
+            liquidity,
+            price_change_1h,
+            reasons.join(" | "),
+        );
     }
-    
-    (50, "No DexScreener data yet".to_string())
+    (45, 0.0, 0.0, "❓ No DEX data yet".to_string())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 📋 HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn print_log(msg: &str) {
-    println!("[{}] {}", Local::now().format("%Y-%m-%d %H:%M:%S"), msg);
-}
-
 fn calculate_whale_amount(score: u8, min_mon: f64, max_mon: f64) -> f64 {
     if score >= 85 {
-        max_mon // 🐳 WHALE
+        max_mon
     } else if score >= 75 {
-        min_mon + (max_mon - min_mon) * 0.6 // 🦈 SHARK
+        min_mon + (max_mon - min_mon) * 0.6
     } else if score >= 65 {
-        min_mon + (max_mon - min_mon) * 0.3 // 🐟 FISH
+        min_mon + (max_mon - min_mon) * 0.3
     } else if score >= 55 {
-        min_mon // 🐟 SMALL
-    } else {
-        0.0 // 💩 SKIP
+        min_mon
+    } else if score >= 40 {
+        min_mon * 0.5
+    }
+    // Shrimp Mode
+    else {
+        0.0
     }
 }
 
 fn decode_create_token_params(input: &[u8]) -> Option<(String, String)> {
-    if input.len() < 100 { return None; }
+    if input.len() < 100 {
+        return None;
+    }
     let mut found_strings = Vec::new();
     let mut current_string = String::new();
     for &byte in input.iter().skip(4) {
-        if byte >= 32 && byte <= 126 { current_string.push(byte as char); } 
-        else {
+        if byte >= 32 && byte <= 126 {
+            current_string.push(byte as char);
+        } else {
             if current_string.len() >= 2 && current_string.len() <= 30 {
-                if current_string.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '-' || c == '_') {
+                if current_string
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == ' ' || c == '-' || c == '_')
+                {
                     found_strings.push(current_string.clone());
                 }
             }
             current_string.clear();
         }
     }
-    if current_string.len() >= 2 { found_strings.push(current_string); }
-    
-    if found_strings.len() >= 2 { Some((found_strings[0].clone(), found_strings[1].clone())) }
-    else if found_strings.len() == 1 { Some((found_strings[0].clone(), found_strings[0].clone())) }
-    else { None }
+    if current_string.len() >= 2 {
+        found_strings.push(current_string);
+    }
+
+    if found_strings.len() >= 2 {
+        Some((found_strings[0].clone(), found_strings[1].clone()))
+    } else if found_strings.len() == 1 {
+        Some((found_strings[0].clone(), found_strings[0].clone()))
+    } else {
+        None
+    }
 }
 
 fn passes_blacklist(name: &str, symbol: &str) -> bool {
     let blacklist = ["test", "scam", "rug", "honeypot", "fake", "airdrop", "free"];
     let name_lower = name.to_lowercase();
     let symbol_lower = symbol.to_lowercase();
-    
-    !blacklist.iter().any(|word| name_lower.contains(word) || symbol_lower.contains(word))
+    !blacklist
+        .iter()
+        .any(|word| name_lower.contains(word) || symbol_lower.contains(word))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -261,235 +452,400 @@ fn passes_blacklist(name: &str, symbol: &str) -> bool {
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
-    
-    print_log("╔═══════════════════════════════════════════════════════════════╗");
-    print_log("║  🔥 GOD MODE v2: CREATOR ANALYSIS + DEXSCREENER 🔥           ║");
-    print_log("╚═══════════════════════════════════════════════════════════════╝");
 
-    let rpc_url_str = env::var("MONAD_RPC_URL").expect("Brak MONAD_RPC_URL");
+    // Initialize tracing
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
+                .with_ansi(true),
+        )
+        .init();
+
+    info!("╔═══════════════════════════════════════════════════════════════╗");
+    info!("║  🔥 GOD MODE v3: WEBSOCKETS + CREATOR ANALYSIS 🔥            ║");
+    info!("╚═══════════════════════════════════════════════════════════════╝");
+
+    let ws_url_str = env::var("MONAD_WS_URL").expect("Brak MONAD_WS_URL");
     let private_key = env::var("PRIVATE_KEY").expect("Brak PRIVATE_KEY");
-    
-    let rpc_url = Url::parse(&rpc_url_str)?;
+
+    let ws_connect = WsConnect::new(ws_url_str);
     let signer = PrivateKeySigner::from_str(&private_key)?;
     let wallet = EthereumWallet::from(signer.clone());
     let bot_address = signer.address();
-    
+
     // Config
-    let whale_min = env::var("WHALE_MIN_AMOUNT_MON").unwrap_or("5.0".to_string()).parse::<f64>().unwrap();
-    let whale_max = env::var("WHALE_MAX_AMOUNT_MON").unwrap_or("50.0".to_string()).parse::<f64>().unwrap();
-    let min_score = env::var("MIN_BUY_SCORE").unwrap_or("55".to_string()).parse::<u8>().unwrap();
-    let router_str = env::var("ROUTER_ADDRESS").unwrap_or("0x6F6B8F1a20703309951a5127c45B49b1CD981A22".to_string());
+    let whale_min = env::var("WHALE_MIN_AMOUNT_MON")
+        .unwrap_or("5.0".to_string())
+        .parse::<f64>()
+        .unwrap();
+    let whale_max = env::var("WHALE_MAX_AMOUNT_MON")
+        .unwrap_or("50.0".to_string())
+        .parse::<f64>()
+        .unwrap();
+    let min_score = env::var("MIN_BUY_SCORE")
+        .unwrap_or("40".to_string())
+        .parse::<u8>()
+        .unwrap();
+    let min_liquidity = env::var("MIN_LIQUIDITY_USD")
+        .unwrap_or("500".to_string())
+        .parse::<f64>()
+        .unwrap();
+    let max_price_pump = env::var("MAX_PRICE_PUMP_1H")
+        .unwrap_or("100".to_string())
+        .parse::<f64>()
+        .unwrap();
+    let wait_for_dex_sec = env::var("WAIT_FOR_DEX_SEC")
+        .unwrap_or("10".to_string())
+        .parse::<u64>()
+        .unwrap();
+    let router_str = env::var("ROUTER_ADDRESS")
+        .unwrap_or("0x6F6B8F1a20703309951a5127c45B49b1CD981A22".to_string());
     let router_address = Address::from_str(&router_str)?;
-    
-    print_log(&format!("👤 Wallet: {:?}", bot_address));
-    print_log(&format!("🐳 Whale Range: {}-{} MON", whale_min, whale_max));
-    print_log(&format!("📊 Min Score: {}", min_score));
-    print_log(&format!("🔗 Router: {:?}", router_address));
-    
+
+    info!(wallet = %bot_address, whale_min, whale_max, min_score, min_liquidity, max_price_pump, wait_for_dex_sec, "Configuration loaded");
+    info!("🔌 Connecting to WebSocket...");
+
     let provider = ProviderBuilder::new()
         .with_recommended_fillers()
         .wallet(wallet)
-        .on_http(rpc_url);
+        .on_ws(ws_connect)
+        .await?;
+
+    info!("✅ WebSocket Connected!");
 
     let http_client = Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
-
-    let mut last_block = provider.get_block_number().await?;
     let mut processed_txs = HashSet::new();
     let mut creator_db = load_creator_db();
-    
+
     // Stats
     let mut tokens_seen = 0u32;
     let mut tokens_bought = 0u32;
     let mut tokens_skipped = 0u32;
-    
-    print_log(&format!("📦 Starting from block: {}", last_block));
-    print_log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    loop {
-        let current_block = provider.get_block_number().await?;
-        if current_block > last_block {
-            if let Ok(Some(block)) = provider.get_block_by_number(current_block.into(), BlockTransactionsKind::Full).await {
-                if let Some(txs) = block.transactions.as_transactions() {
-                    for tx in txs {
-                        let tx_hash = tx.inner.tx_hash();
-                        if processed_txs.contains(tx_hash) { continue; }
-                        processed_txs.insert(*tx_hash);
+    // Subscribe to new blocks
+    let sub = provider.subscribe_blocks().await?;
+    let mut stream = sub.into_stream();
 
-                        if let Some(to) = tx.to() {
-                            if to == router_address {
-                                let input = tx.input();
-                                if input.len() >= 4 && hex::encode(&input[0..4]) == "ba12cd8d" {
-                                    tokens_seen += 1;
-                                    let creator = tx.from;
-                                    let creator_str = format!("{:?}", creator);
-                                    
-                                    print_log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                                    print_log(&format!("🚀 NEW TOKEN #{} | Block: {}", tokens_seen, current_block));
-                                    print_log(&format!("   👤 Creator: {}", &creator_str[..12]));
-                                    
-                                    if let Some((name, symbol)) = decode_create_token_params(input) {
-                                        print_log(&format!("   📝 {} ({})", name, symbol));
-                                        
-                                        // 1. Blacklist check
-                                        if !passes_blacklist(&name, &symbol) {
-                                            print_log("   🚫 BLACKLISTED NAME! Skipping.");
-                                            tokens_skipped += 1;
-                                            continue;
-                                        }
-                                        
-                                        // 2. Creator reputation check
-                                        let creator_stats = creator_db.get(&creator_str).cloned().unwrap_or_default();
-                                        if creator_stats.rugged_tokens > 0 {
-                                            print_log(&format!("   ⚠️  KNOWN RUGGER! ({} rugs) Skipping.", creator_stats.rugged_tokens));
-                                            tokens_skipped += 1;
-                                            continue;
-                                        }
-                                        
-                                        if creator_stats.tokens_created > 0 {
-                                            let success_rate = (creator_stats.successful_tokens as f64 / creator_stats.tokens_created as f64) * 100.0;
-                                            print_log(&format!("   📊 Creator: {} tokens, {:.0}% success rate", 
-                                                creator_stats.tokens_created, success_rate));
-                                        } else {
-                                            print_log("   📊 Creator: New dev (no history)");
-                                        }
-                                        
-                                        // 3. Wait a bit for token to appear on DexScreener
-                                        print_log("   ⏳ Waiting 3s for DEX listing...");
-                                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                        
-                                        // 4. Get token address from receipt
-                                        let mut token_addr = None;
-                                        let mut token_id = U256::ZERO;
-                                        
-                                        for _ in 0..10 {
-                                            if let Ok(Some(receipt)) = provider.get_transaction_receipt(*tx_hash).await {
-                                                for log in receipt.inner.logs() {
-                                                    if let Some(topic0) = log.topics().first() {
-                                                        if topic0 == &B256::from_str("0xd37e3f4f651fe74251701614dbeac478f5a0d29068e87bbe44e5026d166abca9").unwrap() {
-                                                            if let Some(topic1) = log.topics().get(1) { 
-                                                                token_id = U256::from_be_bytes(topic1.0); 
-                                                            }
-                                                            if let Some(topic2) = log.topics().get(2) { 
-                                                                token_addr = Some(Address::from_slice(&topic2[12..32])); 
-                                                                break; 
-                                                            }
+    info!("🎧 Listening for new blocks...");
+    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    while let Some(header) = stream.next().await {
+        let block_number = header.number;
+
+        // Fetch full block to get transactions
+        if let Ok(Some(block)) = provider
+            .get_block_by_number(block_number.into(), BlockTransactionsKind::Full)
+            .await
+        {
+            if let Some(txs) = block.transactions.as_transactions() {
+                for tx in txs {
+                    let tx_hash = tx.inner.tx_hash();
+                    if processed_txs.contains(tx_hash) {
+                        continue;
+                    }
+                    processed_txs.insert(*tx_hash);
+
+                    if let Some(to) = tx.to() {
+                        if to == router_address {
+                            let input = tx.input();
+                            // Check for createTokenAndBuy (selector ba12cd8d)
+                            if input.len() >= 4 && hex::encode(&input[0..4]) == "ba12cd8d" {
+                                tokens_seen += 1;
+                                let creator = tx.from;
+                                let creator_str = format!("{:?}", creator);
+
+                                info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                                info!(tokens_seen, block_number, creator = %&creator_str[..12], "🚀 NEW TOKEN detected");
+
+                                if let Some((name, symbol)) = decode_create_token_params(input) {
+                                    info!(name = %name, symbol = %symbol, "📝 Token info");
+
+                                    // Update creator stats
+                                    {
+                                        let stats =
+                                            creator_db.entry(creator_str.clone()).or_default();
+                                        stats.tokens_created += 1;
+                                        save_creator_db(&creator_db);
+                                    }
+
+                                    // 1. Blacklist check
+                                    if !passes_blacklist(&name, &symbol) {
+                                        warn!(name = %name, "🚫 BLACKLISTED NAME! Skipping.");
+                                        tokens_skipped += 1;
+                                        continue;
+                                    }
+
+                                    // 2. Creator reputation check
+                                    let creator_stats =
+                                        creator_db.get(&creator_str).cloned().unwrap_or_default();
+                                    if creator_stats.rugged_tokens > 0 {
+                                        warn!(
+                                            rugged_tokens = creator_stats.rugged_tokens,
+                                            "⚠️ KNOWN RUGGER! Skipping."
+                                        );
+                                        tokens_skipped += 1;
+                                        continue;
+                                    }
+
+                                    // 3. Wait for DEX listing and receipt
+                                    info!(wait_for_dex_sec, "⏳ Waiting for DEX listing...");
+                                    tokio::time::sleep(std::time::Duration::from_secs(
+                                        wait_for_dex_sec,
+                                    ))
+                                    .await;
+
+                                    // 4. Get token address from receipt (CurveCreate event)
+                                    // NAD.FUN v3 - no tokenId needed, just token address
+                                    let mut token_addr = None;
+
+                                    for attempt in 0..20 {
+                                        // Try 20 times (10 seconds)
+                                        if let Ok(Some(receipt)) =
+                                            provider.get_transaction_receipt(*tx_hash).await
+                                        {
+                                            for log in receipt.inner.logs() {
+                                                if let Some(topic0) = log.topics().first() {
+                                                    // CurveCreate event - token address in topic2
+                                                    if topic0 == &B256::from_str("0xd37e3f4f651fe74251701614dbeac478f5a0d29068e87bbe44e5026d166abca9").unwrap() {
+                                                        if let Some(topic2) = log.topics().get(2) {
+                                                            token_addr = Some(Address::from_slice(&topic2[12..32]));
+                                                            break;
                                                         }
                                                     }
                                                 }
                                             }
-                                            if token_addr.is_some() { break; }
-                                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                         }
-                                        
-                                        if let Some(addr) = token_addr {
-                                            let token_addr_str = format!("{:?}", addr);
-                                            print_log(&format!("   📍 Token: {} (ID: {})", &token_addr_str[..12], token_id));
-                                            
-                                            // 5. DexScreener analysis
-                                            print_log("   🔍 Checking DexScreener...");
-                                            let (dex_score, dex_reason) = analyze_token_quality(&http_client, &token_addr_str).await;
-                                            
-                                            // 6. Calculate final score
-                                            let creator_bonus: i16 = if creator_stats.successful_tokens > 2 { 10 } else { 0 };
-                                            let newbie_penalty: i16 = if creator_stats.tokens_created == 0 { -5 } else { 0 };
-                                            
-                                            let final_score = ((dex_score as i16) + creator_bonus + newbie_penalty).max(0).min(100) as u8;
-                                            
-                                            let emoji = if final_score >= 80 { "🔥🔥🔥" } 
-                                                       else if final_score >= 70 { "✨✨" } 
-                                                       else if final_score >= 60 { "⚡" } 
-                                                       else { "💩" };
-                                            
-                                            print_log(&format!("   {} Final Score: {}/100 | {}", emoji, final_score, dex_reason));
-                                            
-                                            // 7. Calculate buy amount
-                                            let amount_mon = calculate_whale_amount(final_score, whale_min, whale_max);
-                                            
-                                            if amount_mon > 0.0 && final_score >= min_score {
-                                                let whale_emoji = if amount_mon >= whale_max * 0.8 { "🐳" } 
-                                                                 else if amount_mon >= whale_max * 0.5 { "🦈" } 
-                                                                 else { "🐟" };
-                                                
-                                                print_log(&format!("   {} Buying: {:.1} MON", whale_emoji, amount_mon));
-                                                
-                                                let amount_wei = U256::from((amount_mon * 1e18) as u128);
-                                                let deadline = U256::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 120);
-                                                
-                                                let call = buyCall {
-                                                    tokenId: token_id,
-                                                    tokenAddress: addr,
-                                                    recipient: bot_address,
-                                                    deadline,
-                                                };
-                                                
-                                                let tx_req = alloy::rpc::types::TransactionRequest::default()
+                                        if token_addr.is_some() {
+                                            debug!(attempt = attempt + 1, "✅ Receipt found");
+                                            break;
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(500))
+                                            .await;
+                                    }
+
+                                    if let Some(addr) = token_addr {
+                                        let token_addr_str = format!("{:?}", addr);
+
+                                        info!(token = %&token_addr_str[..12], "📍 Token address found");
+
+                                        // 5. DexScreener analysis with enhanced data
+                                        debug!("🔍 Checking DexScreener...");
+                                        let (dex_score, liquidity_usd, price_pump_1h, dex_reason) =
+                                            analyze_token_quality(&http_client, &token_addr_str)
+                                                .await;
+
+                                        // 5a. Liquidity filter
+                                        if liquidity_usd > 0.0 && liquidity_usd < min_liquidity {
+                                            warn!(
+                                                liquidity_usd,
+                                                min_liquidity, "❌ SKIP: Low liquidity"
+                                            );
+                                            tokens_skipped += 1;
+                                            continue;
+                                        }
+
+                                        // 5b. Already pumped filter
+                                        if price_pump_1h > max_price_pump {
+                                            warn!(
+                                                price_pump_1h,
+                                                max_price_pump, "❌ SKIP: Already pumped"
+                                            );
+                                            tokens_skipped += 1;
+                                            continue;
+                                        }
+
+                                        // 5c. Heavy dump filter
+                                        if price_pump_1h < -40.0 {
+                                            warn!(
+                                                price_pump_1h,
+                                                "❌ SKIP: Dumping - avoid falling knife"
+                                            );
+                                            tokens_skipped += 1;
+                                            continue;
+                                        }
+
+                                        // 6. Calculate final score with bonuses/penalties
+                                        let creator_bonus: i16 =
+                                            if creator_stats.successful_tokens > 2 {
+                                                15
+                                            } else if creator_stats.successful_tokens > 0 {
+                                                5
+                                            } else {
+                                                0
+                                            };
+                                        let newbie_penalty: i16 =
+                                            if creator_stats.tokens_created == 0 {
+                                                -5
+                                            } else {
+                                                0
+                                            };
+                                        let liquidity_bonus: i16 =
+                                            if liquidity_usd > 5000.0 { 10 } else { 0 };
+
+                                        let final_score = ((dex_score as i16)
+                                            + creator_bonus
+                                            + newbie_penalty
+                                            + liquidity_bonus)
+                                            .max(0)
+                                            .min(100)
+                                            as u8;
+
+                                        let emoji = if final_score >= 80 {
+                                            "🔥🔥🔥"
+                                        } else if final_score >= 65 {
+                                            "⚡⚡"
+                                        } else if final_score >= 50 {
+                                            "✨"
+                                        } else {
+                                            "💩"
+                                        };
+
+                                        info!(final_score, dex_reason = %dex_reason, "{} Quality score", emoji);
+
+                                        // 7. Calculate buy amount
+                                        let amount_mon = calculate_whale_amount(
+                                            final_score,
+                                            whale_min,
+                                            whale_max,
+                                        )
+                                        .min(1.0); // MAX 1 MON
+
+                                        if amount_mon > 0.0 && final_score >= min_score {
+                                            info!(amount_mon, "🐟 Executing buy");
+
+                                            let amount_wei =
+                                                U256::from((amount_mon * 1e18) as u128);
+                                            let deadline = U256::from(
+                                                SystemTime::now()
+                                                    .duration_since(UNIX_EPOCH)
+                                                    .unwrap()
+                                                    .as_secs()
+                                                    + 120,
+                                            );
+
+                                            // ═══════════════════════════════════════════════════════════════
+                                            // 🔥 NAD.FUN V3 ABI - buy(BuyParams) using sol! macro
+                                            // Correct ABI encoding with tuple struct
+                                            // ═══════════════════════════════════════════════════════════════
+                                            let buy_params = BuyParams {
+                                                amountOutMin: U256::ZERO, // Accept any amount (100% slippage)
+                                                token: addr,
+                                                to: bot_address,
+                                                deadline,
+                                            };
+                                            let buy_call = buyCall { params: buy_params };
+                                            let calldata = buy_call.abi_encode();
+
+                                            debug!(calldata_prefix = %format!("0x{}...", hex::encode(&calldata[..20.min(calldata.len())])), "📝 Transaction calldata");
+
+                                            let tx_req =
+                                                alloy::rpc::types::TransactionRequest::default()
                                                     .to(router_address)
                                                     .value(amount_wei)
-                                                    .input(call.abi_encode().into())
-                                                    .gas_limit(8_000_000)
+                                                    .input(calldata.into())
+                                                    .gas_limit(500_000) // 500k wystarczy, 8M to przesada
                                                     .max_priority_fee_per_gas(1_000_000_000_000);
 
-                                                match provider.send_transaction(tx_req).await {
-                                                    Ok(pending) => {
-                                                        print_log(&format!("   ✅ BUY SENT: {:?}", pending.tx_hash()));
-                                                        tokens_bought += 1;
-                                                        
-                                                        // Update creator stats
-                                                        let stats = creator_db.entry(creator_str.clone()).or_default();
-                                                        stats.tokens_created += 1;
-                                                        save_creator_db(&creator_db);
-                                                        
-                                                        // Save position
-                                                        let position = serde_json::json!({
-                                                            "token_address": token_addr_str,
-                                                            "token_name": format!("{} ({})", name, symbol),
-                                                            "amount_mon": amount_mon,
-                                                            "entry_price_mon": amount_mon,
-                                                            "peak_price_mon": amount_mon,
-                                                            "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-                                                            "creator": creator_str,
-                                                            "score": final_score,
-                                                            "trailing_active": false,
-                                                            "partial_sold": false
-                                                        });
-                                                        
-                                                        let path = "positions.json";
-                                                        let mut positions: serde_json::Value = std::fs::read_to_string(path)
-                                                            .ok()
-                                                            .and_then(|s| serde_json::from_str(&s).ok())
-                                                            .unwrap_or(serde_json::json!({}));
-                                                        
-                                                        positions[token_addr_str] = position;
-                                                        let _ = std::fs::write(path, serde_json::to_string_pretty(&positions).unwrap());
-                                                    },
-                                                    Err(e) => print_log(&format!("   ❌ BUY FAILED: {:?}", e)),
+                                            match provider.send_transaction(tx_req).await {
+                                                Ok(pending) => {
+                                                    let tx_hash = pending.tx_hash();
+                                                    info!(?tx_hash, "✅ BUY SENT");
+                                                    tokens_bought += 1;
+
+                                                    // CRITICAL: Wait for receipt and CHECK STATUS!
+                                                    debug!("⏳ Waiting for receipt...");
+                                                    match tokio::time::timeout(
+                                                        std::time::Duration::from_secs(30),
+                                                        pending.get_receipt(),
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(Ok(receipt)) => {
+                                                            if receipt.status() {
+                                                                info!(
+                                                                    gas_used = receipt.gas_used,
+                                                                    "🎉 SUCCESS!"
+                                                                );
+
+                                                                // Save position
+                                                                let position = serde_json::json!({
+                                                                    "token_address": token_addr_str,
+                                                                    "token_name": format!("{} ({})", name, symbol),
+                                                                    "amount_mon": amount_mon,
+                                                                    "entry_price_mon": amount_mon,
+                                                                    "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                                                                    "score": final_score
+                                                                });
+
+                                                                let path = "positions.json";
+                                                                let mut positions: serde_json::Value = std::fs::read_to_string(path)
+                                                                    .ok()
+                                                                    .and_then(|s| serde_json::from_str(&s).ok())
+                                                                    .unwrap_or(serde_json::json!({}));
+
+                                                                positions[token_addr_str] =
+                                                                    position;
+                                                                let _ = std::fs::write(
+                                                                    path,
+                                                                    serde_json::to_string_pretty(
+                                                                        &positions,
+                                                                    )
+                                                                    .unwrap(),
+                                                                );
+                                                            } else {
+                                                                error!(
+                                                                    gas_used = receipt.gas_used,
+                                                                    "❌ TX FAILED! (wasted MON!)"
+                                                                );
+                                                                error!("🛑 EMERGENCY STOP - BOT ZATRZYMANY ABY NIE STRACIĆ WIĘCEJ MON!");
+                                                                std::process::exit(1);
+                                                                // STOP immediately after first failure!
+                                                            }
+                                                        }
+                                                        Ok(Err(e)) => {
+                                                            error!(?e, "❌ Receipt error");
+                                                            error!("🛑 EMERGENCY STOP");
+                                                            std::process::exit(1);
+                                                        }
+                                                        Err(_) => {
+                                                            error!("⏱️ Receipt timeout (30s)");
+                                                            error!("🛑 EMERGENCY STOP");
+                                                            std::process::exit(1);
+                                                        }
+                                                    }
                                                 }
-                                            } else {
-                                                print_log(&format!("   💩 Score {} < {} minimum. Skipping.", final_score, min_score));
-                                                tokens_skipped += 1;
+                                                Err(e) => {
+                                                    error!(?e, "❌ TX send error");
+                                                    error!("🛑 EMERGENCY STOP");
+                                                    std::process::exit(1);
+                                                }
                                             }
+                                        } else {
+                                            warn!(
+                                                final_score,
+                                                min_score, "💩 Score below minimum. Skipping."
+                                            );
+                                            tokens_skipped += 1;
                                         }
                                     }
-                                    
-                                    // Stats
-                                    print_log(&format!("   📈 Stats: Seen={} | Bought={} | Skipped={}", 
-                                        tokens_seen, tokens_bought, tokens_skipped));
                                 }
                             }
                         }
                     }
                 }
             }
-            last_block = current_block;
         }
-        
+
         // Cleanup old processed txs
         if processed_txs.len() > 1000 {
             processed_txs.clear();
         }
-        
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+
+    Ok(())
 }

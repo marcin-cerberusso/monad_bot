@@ -7,10 +7,12 @@ package-lock.json
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+*.log
 
 # Environment
 .env
 .env.local
+*.tmp
 
 # Editor
 .vscode/
@@ -19,6 +21,15 @@ yarn-error.log*
 *.swo
 *~
 .DS_Store
+__pycache__/
+
+# Binaries / SDK
+google-cloud-sdk/
+.cache_ggshield
+
+# Local artifacts
+*.prompt.md
+
 
 # Snyk Security Extension - AI Rules (auto-generated)
 .cursor/rules/snyk_rules.mdc
@@ -33,3 +44,7 @@ yarn-error.log*
 
 #Ignore cursor AI rules
 .cursor/rules/codacy.mdc
+
+
+#Ignore vscode AI rules
+.github/instructions/codacy.instructions.md
