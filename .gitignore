@@ -48,3 +48,4 @@ google-cloud-sdk/
 
 #Ignore vscode AI rules
 .github/instructions/codacy.instructions.md
+google-cloud-cli-linux-x86_64.tar.gz
