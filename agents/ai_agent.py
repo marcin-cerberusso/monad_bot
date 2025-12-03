@@ -1,5 +1,6 @@
 """
 🧠 AI AGENT - DeepSeek/Gemini analiza tokenów
++ Integracja z LeverUp dla wysokiego confidence
 """
 import asyncio
 import aiohttp
@@ -11,6 +12,7 @@ from dotenv import load_dotenv
 from .base_agent import BaseAgent, Message, MessageTypes, Channels
 from . import decision_logger
 from . import config
+from .leverage_agent import LeverageConfig, should_use_leverage
 
 load_dotenv()
 
@@ -76,6 +78,24 @@ class AIAgent(BaseAgent):
                 },
                 sender=self.name
             ))
+            
+            # === LEVERAGE: Wysyłaj do LeverageAgent gdy confidence >= 85% ===
+            ai_decision_for_leverage = {
+                "decision": "BUY",
+                "confidence": decision.get("confidence", 0),
+                "token_symbol": data.get("token_symbol", "MON")
+            }
+            if should_use_leverage(ai_decision_for_leverage):
+                self.log(f"  🔥 HIGH CONFIDENCE ({decision['confidence']}%) - sending leverage signal")
+                await self.publish("monad:leverage", Message(
+                    type="leverage_signal",
+                    data={
+                        "token": ai_decision_for_leverage["token_symbol"],
+                        "direction": "long",
+                        "confidence": decision["confidence"]
+                    },
+                    sender=self.name
+                ))
     
     def _build_prompt(self, data: dict) -> str:
         """Build AI prompt"""
