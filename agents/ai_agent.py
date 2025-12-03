@@ -12,12 +12,23 @@ from dotenv import load_dotenv
 from .base_agent import BaseAgent, Message, MessageTypes, Channels
 from . import decision_logger
 from . import config
-from .leverage_agent import LeverageConfig, should_use_leverage
+from .leverage_agent import LeverageConfig, LeverageAgent, should_use_leverage
 
 load_dotenv()
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Global leverage agent instance
+_leverage_agent: Optional[LeverageAgent] = None
+
+
+def get_leverage_agent() -> Optional[LeverageAgent]:
+    """Lazy initialization of LeverageAgent"""
+    global _leverage_agent
+    if _leverage_agent is None and LeverageConfig.ENABLED:
+        _leverage_agent = LeverageAgent()
+    return _leverage_agent
 
 
 class AIAgent(BaseAgent):
@@ -86,16 +97,17 @@ class AIAgent(BaseAgent):
                 "token_symbol": data.get("token_symbol", "MON")
             }
             if should_use_leverage(ai_decision_for_leverage):
-                self.log(f"  🔥 HIGH CONFIDENCE ({decision['confidence']}%) - sending leverage signal")
-                await self.publish("monad:leverage", Message(
-                    type="leverage_signal",
-                    data={
-                        "token": ai_decision_for_leverage["token_symbol"],
-                        "direction": "long",
-                        "confidence": decision["confidence"]
-                    },
-                    sender=self.name
-                ))
+                self.log(f"  🔥 HIGH CONFIDENCE ({decision['confidence']}%) - opening leverage position")
+                leverage_agent = get_leverage_agent()
+                if leverage_agent and leverage_agent.config.ENABLED:
+                    try:
+                        await leverage_agent.handle_signal({
+                            "token": ai_decision_for_leverage["token_symbol"],
+                            "direction": "long",
+                            "confidence": decision["confidence"]
+                        })
+                    except Exception as e:
+                        self.log(f"  ⚠️ Leverage error: {e}")
     
     def _build_prompt(self, data: dict) -> str:
         """Build AI prompt"""

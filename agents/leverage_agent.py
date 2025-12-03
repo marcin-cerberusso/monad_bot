@@ -11,7 +11,6 @@ from web3 import Web3
 from eth_account import Account
 from . import config
 from .config import setup_logging
-from .message_bus import MessageBus
 
 logger = setup_logging("LeverageAgent")
 
@@ -139,10 +138,10 @@ class LeverageAgent:
     """
     Agent do handlu z dźwignią na LeverUp.
     Używany TYLKO dla wysokiego confidence sygnałów.
+    Wywołany bezpośrednio przez AIAgent (nie przez message bus).
     """
     
-    def __init__(self, message_bus: MessageBus):
-        self.bus = message_bus
+    def __init__(self):
         self.w3: Optional[Web3] = None
         self.account = None
         self.leverup_contract = None
@@ -175,18 +174,21 @@ class LeverageAgent:
             self.config.ENABLED = False
     
     async def start(self):
-        """Start agenta"""
+        """Start agenta - standalone mode"""
         if not self.config.ENABLED:
             logger.warning("⚠️ LeverageAgent DISABLED - no wallet or connection")
             return
         
-        await self.bus.subscribe("monad:leverage", self._handle_message)
-        logger.info("🔥 LeverageAgent started - listening for high-confidence signals")
+        logger.info("🔥 LeverageAgent started - ready for high-confidence signals")
         
         # Heartbeat
         while True:
             await asyncio.sleep(60)
             logger.info(f"💓 ALIVE | Open positions: {len(self.open_positions)}")
+    
+    async def handle_signal(self, signal: Dict[str, Any]):
+        """Bezpośrednia obsługa sygnału (wywoływana przez AIAgent)"""
+        await self._process_leverage_signal(signal)
     
     async def _handle_message(self, message: Dict[str, Any]):
         """Obsługa wiadomości"""
