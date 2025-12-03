@@ -8,6 +8,7 @@ from typing import Tuple
 from dotenv import load_dotenv
 
 from .base_agent import BaseAgent, Message, MessageTypes, Channels
+from . import decision_logger
 
 load_dotenv()
 
@@ -58,22 +59,28 @@ class RiskAgent(BaseAgent):
         if is_honeypot:
             self.log(f"  🚫 HONEYPOT! Tax: {tax:.1f}%")
             self.blocked_tokens.add(token)
+            decision_logger.log_risk_check(token, False, f"Honeypot: tax {tax:.1f}%", {"tax_percent": tax, "is_honeypot": True})
             return
         
         # 3. Get liquidity from DexScreener
         liquidity = await self._get_liquidity(token)
         if liquidity < MIN_LIQUIDITY_USD:
             self.log(f"  ⚠️ Low liquidity: ${liquidity:.0f}")
+            decision_logger.log_risk_check(token, False, f"Low liquidity: ${liquidity:.0f}", {"liquidity_usd": liquidity})
             return
         
         # 4. FOMO check
         pump_1h = await self._get_pump_percent(token)
         if pump_1h > MAX_FOMO_PUMP_1H:
             self.log(f"  🔥 FOMO! Already +{pump_1h:.0f}% in 1h")
+            decision_logger.log_risk_check(token, False, f"FOMO: +{pump_1h:.0f}% in 1h", {"pump_1h": pump_1h})
             return
         
         # All checks passed!
         self.log(f"  ✅ APPROVED! Tax={tax:.1f}% Liq=${liquidity:.0f}")
+        decision_logger.log_risk_check(token, True, "All checks passed", {
+            "tax_percent": tax, "liquidity_usd": liquidity, "pump_1h": pump_1h, "is_honeypot": False
+        })
         
         # Send to AI for analysis
         await self.publish(Channels.AI, Message(

@@ -10,6 +10,7 @@ import websockets
 from dotenv import load_dotenv
 
 from .base_agent import BaseAgent, Message, MessageTypes, Channels
+from . import decision_logger
 
 load_dotenv()
 
@@ -94,6 +95,14 @@ class WhaleAgent(BaseAgent):
             self.whales_seen += 1
             
             self.log(f"🐳 WHALE BUY: {value_mon:.1f} MON -> {token[:12]}...")
+            
+            # Log for ML
+            decision_logger.log_whale_signal({
+                "token": token,
+                "whale": whale,
+                "amount_mon": value_mon,
+                "tx_hash": tx_hash
+            })
             
             # Notify
             await self.notify(

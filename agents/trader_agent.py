@@ -13,6 +13,7 @@ from web3 import Web3
 
 from .base_agent import BaseAgent, Message, MessageTypes, Channels
 from .notifications import notifier
+from . import decision_logger
 
 load_dotenv()
 
@@ -75,6 +76,17 @@ class TraderAgent(BaseAgent):
         if success:
             self.trades_today += 1
             
+            # Log for ML
+            decision_logger.log_trade(
+                token=token,
+                action="BUY",
+                amount_mon=amount,
+                tx_hash=tx_hash,
+                success=True,
+                whale_amount=data.get("amount_mon"),
+                ai_confidence=data.get("ai_decision", {}).get("confidence")
+            )
+            
             # Save position
             position = {
                 "token": token,
@@ -104,6 +116,13 @@ class TraderAgent(BaseAgent):
             ))
         else:
             self.log(f"  ❌ Buy failed")
+            decision_logger.log_trade(
+                token=token,
+                action="BUY",
+                amount_mon=amount,
+                success=False,
+                error="Transaction failed"
+            )
             await notifier.send_alert(
                 "🔴 BUY FAILED",
                 f"Failed to buy `{token}`",

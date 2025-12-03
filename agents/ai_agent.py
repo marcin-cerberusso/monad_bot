@@ -9,6 +9,7 @@ from typing import Optional, Dict
 from dotenv import load_dotenv
 
 from .base_agent import BaseAgent, Message, MessageTypes, Channels
+from . import decision_logger
 
 load_dotenv()
 
@@ -59,6 +60,9 @@ class AIAgent(BaseAgent):
         
         self.log(f"  AI Decision: {decision['action']} (confidence: {decision['confidence']}%)")
         self.log(f"  Reason: {decision['reason'][:50]}...")
+        
+        # Log for ML
+        decision_logger.log_ai_decision(token, decision, data)
         
         if decision["action"] == "BUY":
             # Send buy order to trader
