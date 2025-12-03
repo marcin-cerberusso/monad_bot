@@ -252,10 +252,10 @@
             </div>
             <div class="card rounded-xl p-4">
                 <div class="flex items-center gap-3">
-                    <span class="text-3xl">🔫</span>
+                    <span class="text-3xl">📊</span>
                     <div>
-                        <p class="text-gray-400 text-sm">Mempool Sniper</p>
-                        <p class="text-green-400 font-bold">Active • 3-8 MON</p>
+                        <p class="text-gray-400 text-sm">Position Manager</p>
+                        <p class="text-green-400 font-bold">Active • Trailing Stops</p>
                     </div>
                 </div>
             </div>
@@ -270,6 +270,107 @@
             </div>
         </section>
 
+        <!-- Real-time Logs Panel -->
+        <section class="card rounded-xl overflow-hidden" x-data="logsPanel()" x-init="init()">
+            <div class="p-4 border-b border-white/10 flex justify-between items-center bg-gradient-to-r from-emerald-500/10 to-cyan-500/10">
+                <h2 class="text-lg font-bold flex items-center gap-2">
+                    <span class="text-2xl">📜</span> Live Logs
+                </h2>
+                <div class="flex items-center gap-3">
+                    <!-- Bot selector tabs -->
+                    <div class="flex bg-black/30 rounded-lg p-1">
+                        <button @click="switchBot('whale_follower')" 
+                                :class="currentBot === 'whale_follower' ? 'bg-cyan-500/30 text-cyan-400' : 'text-gray-400 hover:text-white'"
+                                class="px-3 py-1 rounded text-sm font-medium transition-all">
+                            🐳 Whale
+                        </button>
+                        <button @click="switchBot('position_manager')" 
+                                :class="currentBot === 'position_manager' ? 'bg-purple-500/30 text-purple-400' : 'text-gray-400 hover:text-white'"
+                                class="px-3 py-1 rounded text-sm font-medium transition-all">
+                            📊 PM
+                        </button>
+                        <button @click="switchBot('take_profits')" 
+                                :class="currentBot === 'take_profits' ? 'bg-green-500/30 text-green-400' : 'text-gray-400 hover:text-white'"
+                                class="px-3 py-1 rounded text-sm font-medium transition-all">
+                            💰 TP
+                        </button>
+                    </div>
+                    <!-- Live indicator -->
+                    <div class="flex items-center gap-2">
+                        <span class="w-2 h-2 bg-green-500 rounded-full" :class="streaming ? 'pulse' : ''"></span>
+                        <span class="text-xs text-gray-400" x-text="streaming ? 'Live' : 'Paused'"></span>
+                    </div>
+                    <!-- Controls -->
+                    <button @click="toggleStream()" 
+                            :class="streaming ? 'bg-red-500/20 text-red-400' : 'bg-green-500/20 text-green-400'"
+                            class="px-3 py-1 rounded text-sm hover:opacity-80 transition-all">
+                        <span x-text="streaming ? '⏸ Pause' : '▶ Resume'"></span>
+                    </button>
+                    <button @click="clearLogs()" class="px-3 py-1 bg-gray-500/20 text-gray-400 rounded text-sm hover:bg-gray-500/30">
+                        🗑 Clear
+                    </button>
+                </div>
+            </div>
+            
+            <!-- Log filters -->
+            <div class="px-4 py-2 border-b border-white/5 flex gap-2 flex-wrap">
+                <button @click="toggleFilter('all')" 
+                        :class="activeFilters.includes('all') ? 'bg-white/20 text-white' : 'bg-white/5 text-gray-400'"
+                        class="px-2 py-1 rounded text-xs hover:bg-white/10 transition-all">All</button>
+                <button @click="toggleFilter('whale')" 
+                        :class="activeFilters.includes('whale') ? 'bg-cyan-500/30 text-cyan-400' : 'bg-white/5 text-gray-400'"
+                        class="px-2 py-1 rounded text-xs hover:bg-white/10 transition-all">🐳 Whale</button>
+                <button @click="toggleFilter('success')" 
+                        :class="activeFilters.includes('success') ? 'bg-green-500/30 text-green-400' : 'bg-white/5 text-gray-400'"
+                        class="px-2 py-1 rounded text-xs hover:bg-white/10 transition-all">✅ Success</button>
+                <button @click="toggleFilter('error')" 
+                        :class="activeFilters.includes('error') ? 'bg-red-500/30 text-red-400' : 'bg-white/5 text-gray-400'"
+                        class="px-2 py-1 rounded text-xs hover:bg-white/10 transition-all">❌ Errors</button>
+                <button @click="toggleFilter('warning')" 
+                        :class="activeFilters.includes('warning') ? 'bg-yellow-500/30 text-yellow-400' : 'bg-white/5 text-gray-400'"
+                        class="px-2 py-1 rounded text-xs hover:bg-white/10 transition-all">⚠️ Warnings</button>
+                <button @click="toggleFilter('stats')" 
+                        :class="activeFilters.includes('stats') ? 'bg-purple-500/30 text-purple-400' : 'bg-white/5 text-gray-400'"
+                        class="px-2 py-1 rounded text-xs hover:bg-white/10 transition-all">📊 Stats</button>
+            </div>
+            
+            <!-- Log output -->
+            <div id="logContainer" class="h-96 overflow-y-auto bg-black/30 font-mono text-sm p-4 space-y-1" 
+                 x-ref="logContainer">
+                <template x-for="(log, index) in filteredLogs" :key="index">
+                    <div class="flex gap-2 py-1 border-b border-white/5 hover:bg-white/5 transition-all"
+                         :class="{
+                             'bg-green-500/5': log.type === 'success',
+                             'bg-red-500/5': log.type === 'error',
+                             'bg-yellow-500/5': log.type === 'warning',
+                             'bg-cyan-500/5': log.type === 'whale'
+                         }">
+                        <span class="text-gray-500 text-xs w-20 flex-shrink-0" x-text="formatLogTime(log.timestamp)"></span>
+                        <span class="w-12 flex-shrink-0 text-center"
+                              :class="{
+                                  'text-green-400': log.level === 'INFO' && log.type === 'success',
+                                  'text-red-400': log.level === 'ERROR' || log.type === 'error',
+                                  'text-yellow-400': log.level === 'WARN' || log.type === 'warning',
+                                  'text-cyan-400': log.type === 'whale',
+                                  'text-gray-400': log.type === 'info'
+                              }"
+                              x-text="log.level"></span>
+                        <span class="text-gray-300 flex-1 break-all" x-text="log.message"></span>
+                    </div>
+                </template>
+                <div x-show="filteredLogs.length === 0" class="text-center text-gray-500 py-8">
+                    <span class="text-4xl">📜</span>
+                    <p class="mt-2">No logs matching filters. Waiting for activity...</p>
+                </div>
+            </div>
+            
+            <!-- Log stats bar -->
+            <div class="px-4 py-2 border-t border-white/10 flex justify-between items-center text-xs text-gray-500 bg-black/20">
+                <span x-text="'Showing ' + filteredLogs.length + ' of ' + logs.length + ' logs'"></span>
+                <span x-text="'Bot: ' + currentBot.replace('_', ' ').toUpperCase()"></span>
+            </div>
+        </section>
+
     </main>
 
     <footer class="border-t border-white/10 p-6 mt-8">
@@ -280,6 +381,135 @@
 
     <script>
         let equityChart, pnlChart;
+        
+        // Logs Panel Component
+        function logsPanel() {
+            return {
+                logs: [],
+                currentBot: 'whale_follower',
+                streaming: true,
+                eventSource: null,
+                activeFilters: ['all'],
+                maxLogs: 200,
+                
+                get filteredLogs() {
+                    if (this.activeFilters.includes('all')) {
+                        return this.logs;
+                    }
+                    return this.logs.filter(log => this.activeFilters.includes(log.type));
+                },
+                
+                async init() {
+                    await this.loadInitialLogs();
+                    this.startStream();
+                },
+                
+                async loadInitialLogs() {
+                    try {
+                        const res = await fetch(`/api/logs/${this.currentBot}?lines=100`);
+                        const logs = await res.json();
+                        this.logs = logs.reverse(); // Oldest first, newest at bottom
+                        this.$nextTick(() => this.scrollToBottom());
+                    } catch (e) {
+                        console.error('Failed to load logs:', e);
+                    }
+                },
+                
+                startStream() {
+                    if (this.eventSource) {
+                        this.eventSource.close();
+                    }
+                    
+                    this.eventSource = new EventSource(`/api/logs/stream/${this.currentBot}`);
+                    this.streaming = true;
+                    
+                    this.eventSource.onmessage = (event) => {
+                        const log = JSON.parse(event.data);
+                        this.logs.push(log);
+                        
+                        // Trim to max logs
+                        if (this.logs.length > this.maxLogs) {
+                            this.logs = this.logs.slice(-this.maxLogs);
+                        }
+                        
+                        this.$nextTick(() => this.scrollToBottom());
+                    };
+                    
+                    this.eventSource.onerror = () => {
+                        console.log('SSE connection lost, reconnecting...');
+                        this.streaming = false;
+                        setTimeout(() => {
+                            if (!this.streaming) this.startStream();
+                        }, 3000);
+                    };
+                },
+                
+                stopStream() {
+                    if (this.eventSource) {
+                        this.eventSource.close();
+                        this.eventSource = null;
+                    }
+                    this.streaming = false;
+                },
+                
+                toggleStream() {
+                    if (this.streaming) {
+                        this.stopStream();
+                    } else {
+                        this.startStream();
+                    }
+                },
+                
+                async switchBot(botName) {
+                    this.currentBot = botName;
+                    this.logs = [];
+                    this.stopStream();
+                    await this.loadInitialLogs();
+                    this.startStream();
+                },
+                
+                toggleFilter(filter) {
+                    if (filter === 'all') {
+                        this.activeFilters = ['all'];
+                    } else {
+                        // Remove 'all' if specific filter selected
+                        this.activeFilters = this.activeFilters.filter(f => f !== 'all');
+                        
+                        if (this.activeFilters.includes(filter)) {
+                            this.activeFilters = this.activeFilters.filter(f => f !== filter);
+                        } else {
+                            this.activeFilters.push(filter);
+                        }
+                        
+                        // If no filters, default to 'all'
+                        if (this.activeFilters.length === 0) {
+                            this.activeFilters = ['all'];
+                        }
+                    }
+                },
+                
+                clearLogs() {
+                    this.logs = [];
+                },
+                
+                scrollToBottom() {
+                    const container = this.$refs.logContainer;
+                    if (container) {
+                        container.scrollTop = container.scrollHeight;
+                    }
+                },
+                
+                formatLogTime(timestamp) {
+                    if (!timestamp) return '--:--:--';
+                    try {
+                        const date = new Date(timestamp);
+                        return date.toLocaleTimeString('en-GB');
+                    } catch {
+                        return timestamp.split('T')[1]?.split('.')[0] || '--:--:--';
+                    }
+                }
+            }
+        }
         
         function dashboard() {
             return {

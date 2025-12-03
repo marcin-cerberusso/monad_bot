@@ -83,6 +83,11 @@ struct Position {
     tp_level_2_taken: bool, // 100% profit - sell 30%
     #[serde(default)]
     tp_level_3_taken: bool, // 200% profit - sell remaining (moonbag)
+    // Whale exit detection - if the whale we followed sells, flag it
+    #[serde(default)]
+    whale_exited: bool,
+    #[serde(default)]
+    whale_exit_time: Option<u64>,
 }
 
 fn default_name() -> String {
@@ -110,14 +115,41 @@ struct Settings {
     moonbag_portion: f64,
 }
 
+impl Settings {
+    /// Load settings from ENV with fallback to defaults
+    fn from_env() -> Self {
+        let trailing_stop_pct = env::var("PM_TRAILING_STOP_PCT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(20.0);
+
+        let hard_stop_loss_pct = env::var("PM_HARD_STOP_LOSS_PCT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(-20.0);
+
+        let take_profit_pct = env::var("PM_TAKE_PROFIT_PCT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(100.0);
+
+        let moonbag_portion = env::var("PM_MOONBAG_PORTION")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.3);
+
+        Self {
+            trailing_stop_pct,
+            hard_stop_loss_pct,
+            take_profit_pct,
+            moonbag_portion,
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
-        Settings {
-            trailing_stop_pct: 20.0,
-            hard_stop_loss_pct: -40.0,
-            take_profit_pct: 100.0,
-            moonbag_portion: 0.3,
-        }
+        Self::from_env()
     }
 }
 
@@ -686,8 +718,19 @@ async fn main() -> Result<()> {
                                 );
                             }
                         }
-                        // 📉 TRAILING STOP (aktywny po 30% zysku, drop 10% od ATH = sprzedaj)
-                        else if pnl_pct > 30.0 && drop_from_ath >= 10.0 {
+                        // 🚨 WHALE EXIT - The whale we followed is selling! URGENT SELL
+                        else if updated_pos.whale_exited {
+                            should_sell = true;
+                            sell_reason = format!(
+                                "🚨 WHALE EXIT! Following whale sold - current PnL: {:.1}%",
+                                pnl_pct
+                            );
+                            // Sell everything - whale knows something we don't
+                            sell_amount = U256::from((balance_tokens * 1e18) as u128);
+                        }
+                        // 📉 TRAILING STOP (aktywny po 20% zysku, drop 10% od ATH = sprzedaj)
+                        // Obniżony z 30% do 20% żeby chronić zyski wcześniej
+                        else if pnl_pct > 20.0 && drop_from_ath >= 10.0 {
                             should_sell = true;
                             sell_reason = format!(
                                 "📉 TRAILING STOP (profit {:.1}%, drop {:.1}% >= 10%)",

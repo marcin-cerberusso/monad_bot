@@ -14,10 +14,26 @@ from file_utils import safe_load_json, safe_save_json
 
 load_dotenv()
 
-# Config
-RPC_URL = os.getenv("MONAD_RPC_URL", "https://monad-mainnet.g.alchemy.com/v2/FPgsxxE5R86qHQ200z04i")
+# Config - MUST be set in .env, no defaults for security
+RPC_URL = os.getenv("MONAD_RPC_URL")
+if not RPC_URL:
+    raise ValueError("MONAD_RPC_URL must be set in .env - no hardcoded defaults allowed")
+
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-ROUTER = "0x6F6B8F1a20703309951a5127c45B49b1CD981A22"
+if not PRIVATE_KEY:
+    raise ValueError("PRIVATE_KEY must be set in .env")
+
+# Allowed routers (whitelist)
+ALLOWED_ROUTERS = {
+    "0x6F6B8F1a20703309951a5127c45B49b1CD981A22",  # NAD.FUN BondingCurveRouter
+}
+ROUTER = os.getenv("ROUTER_ADDRESS", "0x6F6B8F1a20703309951a5127c45B49b1CD981A22")
+if ROUTER not in ALLOWED_ROUTERS:
+    raise ValueError(f"Router {ROUTER} not in whitelist")
+
+# Slippage protection
+MAX_SLIPPAGE_PERCENT = float(os.getenv("MAX_SLIPPAGE_PERCENT", "10"))  # 10% max slippage
+MIN_AMOUNT_OUT_RATIO = 1.0 - (MAX_SLIPPAGE_PERCENT / 100)
 
 # ABI
 ERC20_ABI = [
@@ -95,12 +111,13 @@ def main():
             
             print(f"   💰 Token balance: {token_balance / 1e18:.2f}")
             
-            # Approve
-            nonce = w3.eth.get_transaction_count(my_address)
+            # Approve - use 'pending' nonce to avoid collisions
+            nonce = w3.eth.get_transaction_count(my_address, 'pending')
+            gas_price = w3.eth.gas_price
             approve_tx = token.functions.approve(ROUTER, token_balance).build_transaction({
                 'from': my_address,
                 'gas': 100000,
-                'gasPrice': w3.eth.gas_price,
+                'gasPrice': gas_price,
                 'nonce': nonce,
                 'chainId': 143
             })
@@ -111,21 +128,30 @@ def main():
             
             time.sleep(1)
             
-            # Sell
+            # Get quote for slippage protection
+            # Estimate: use token value from position or fallback to 90% of entry
+            estimated_value = pos.get("current_value_mon", entry_mon * 0.9)
+            min_amount_out = int(estimated_value * MIN_AMOUNT_OUT_RATIO * 1e18)  # With slippage protection
+            if min_amount_out < 1:
+                min_amount_out = 1  # Absolute minimum
+            
+            # Sell with slippage protection
             deadline = int(time.time()) + 300
             sell_params = (
                 token_balance,      # amountIn
-                1,                  # amountOutMin (accept any)
+                min_amount_out,     # amountOutMin (with slippage protection)
                 token_addr_cs,      # token
                 my_address,         # to
                 deadline            # deadline
             )
             
-            nonce = w3.eth.get_transaction_count(my_address)
+            # Use 'pending' nonce and reasonable gas bump (+20 gwei, not +100)
+            nonce = w3.eth.get_transaction_count(my_address, 'pending')
+            priority_fee = min(gas_price // 5, 20 * 10**9)  # +20% or max 20 gwei
             sell_tx = router.functions.sell(sell_params).build_transaction({
                 'from': my_address,
                 'gas': 500000,
-                'gasPrice': w3.eth.gas_price + 100000000000,  # +100 gwei priority
+                'gasPrice': gas_price + priority_fee,
                 'nonce': nonce,
                 'chainId': 143
             })

@@ -57,6 +57,7 @@ serde_json = "1.0"
 futures = "0.3"
 hex = "0.4"
 dexscreener = "0.2"
+# redis removed - using file-based blocklist
 
 # Tracing / OpenTelemetry
 tracing = "0.1"

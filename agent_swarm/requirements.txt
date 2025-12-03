@@ -1,0 +1,17 @@
+# Agent Swarm V2 Requirements
+# Message Bus
+redis>=5.0.0
+python-dotenv>=1.0.0
+
+# HTTP Client
+aiohttp>=3.9.0
+
+# Utils
+psutil>=5.9.0
+
+# Optional: AI Analysis
+# openai>=1.0.0  # for DeepSeek API
+
+# Dashboard (if using Flask)
+flask>=2.3.0
+flask-cors>=4.0.0

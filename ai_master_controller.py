@@ -8,6 +8,11 @@ Pełna kontrola nad:
 - position_manager
 - Konfiguracja (.env)
 - Pozycje (kupno/sprzedaż)
+
+SECURITY:
+- AI actions are validated against whitelist
+- SELL_ALL requires confirmation
+- Config updates limited to safe keys
 """
 
 import os
@@ -28,6 +33,17 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 MONAD_RPC_URL = os.getenv("MONAD_RPC_URL", "")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "0x7b2897EA9547a6BB3c147b3E262483ddAb132A7D")
+
+# SECURITY: Whitelists for AI actions
+ALLOWED_BOTS = {"whale_follower", "mempool_sniper", "position_manager", "copy_trader"}
+ALLOWED_CONFIG_KEYS = {
+    "MIN_BUY_SCORE", "FOLLOW_AMOUNT_MON", "MAX_OPEN_POSITIONS",
+    "TRAILING_STOP_PCT", "HARD_STOP_LOSS_PCT", "TAKE_PROFIT_PCT",
+    "MIN_LIQUIDITY_USD", "MIN_WHALE_BUY_MON"
+}
+# DANGEROUS actions that require confirmation file
+DANGEROUS_ACTIONS = {"SELL_ALL", "UPDATE_ENV"}
+CONFIRM_FILE = Path(__file__).parent / ".ai_confirm"
 
 # Paths
 BASE_DIR = Path(__file__).parent
@@ -365,26 +381,47 @@ Przeanalizuj system i wydaj komendy. Odpowiedz TYLKO w JSON:
 
 
 def execute_actions(actions: list):
-    """Wykonuje akcje wydane przez AI"""
+    """Wykonuje akcje wydane przez AI z walidacją bezpieczeństwa"""
     
     for action in actions:
         action_type = action.get("type", "")
         
+        # SECURITY: Validate action type
+        if action_type not in {"START_BOT", "STOP_BOT", "UPDATE_CONFIG", "SELL_ALL", "RESTART_BOT"}:
+            log(f"⚠️ Unknown action type: {action_type}, skipping")
+            continue
+        
         if action_type == "START_BOT":
             bot = action.get("bot", "")
+            # SECURITY: Only allow whitelisted bots
+            if bot not in ALLOWED_BOTS:
+                log(f"⚠️ Bot '{bot}' not in whitelist, skipping")
+                continue
             start_bot(bot)
             
         elif action_type == "STOP_BOT":
             bot = action.get("bot", "")
+            if bot not in ALLOWED_BOTS:
+                log(f"⚠️ Bot '{bot}' not in whitelist, skipping")
+                continue
             stop_bot(bot)
             
         elif action_type == "UPDATE_CONFIG":
             key = action.get("key", "")
             value = action.get("value", "")
+            # SECURITY: Only allow whitelisted config keys
+            if key not in ALLOWED_CONFIG_KEYS:
+                log(f"⚠️ Config key '{key}' not in whitelist, skipping")
+                continue
             if key and value:
                 update_env_config({key: value})
                 
         elif action_type == "SELL_ALL":
+            # SECURITY: Require confirmation file for dangerous actions
+            if not CONFIRM_FILE.exists():
+                log("🚨 SELL_ALL blocked - create .ai_confirm file to enable")
+                send_telegram("⚠️ AI requested SELL_ALL but blocked. Create .ai_confirm to enable.")
+                continue
             log("🚨 SELL_ALL triggered - running emergency sell...")
             try:
                 subprocess.run(["python3", "emergency_sell_all.py"], 
@@ -394,6 +431,9 @@ def execute_actions(actions: list):
                 
         elif action_type == "RESTART_BOT":
             bot = action.get("bot", "")
+            if bot not in ALLOWED_BOTS:
+                log(f"⚠️ Bot '{bot}' not in whitelist, skipping")
+                continue
             stop_bot(bot)
             import time
             time.sleep(2)

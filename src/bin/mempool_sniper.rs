@@ -18,8 +18,10 @@ use std::{
 };
 
 use futures::StreamExt;
+// Removed redis - using file-based blocklist instead
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 // Tracing
 use tracing::{debug, error, info, warn};
@@ -47,6 +49,20 @@ sol! {
     #[derive(Debug)]
     function buy(BuyParams params) external payable;
 }
+
+// Lens quote
+sol! {
+    #[derive(Debug)]
+    function getAmountOut(address token, uint256 amountIn, bool isBuy) external view returns (address router, uint256 amountOut);
+}
+
+// NAD.FUN Lens for on-chain quotes
+const NADFUN_LENS: &str = "0x7e78A8DE94f21804F7a17F4E8BF9EC2c872187ea";
+const DEFAULT_SLIPPAGE_BPS: u128 = 200; // 2%
+const DEFAULT_MIN_LIQ_USD: f64 = 3000.0;
+const DEFAULT_LIQ_PCT: f64 = 0.01; // max 1% liq per buy (approx, assuming MON ~ USD)
+const DEFAULT_BUNDLE_MIN_COUNT: u32 = 3;
+const DEFAULT_MAX_GAS_GWEI: u64 = 120;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 📊 DEXSCREENER TYPES
@@ -93,6 +109,38 @@ struct Transactions {
 struct TxCount {
     buys: Option<u32>,
     sells: Option<u32>,
+}
+
+/// Check file-based blocklist (Python blocklist.py)
+async fn is_risk_blocked(token: &str) -> bool {
+    // Read blocked_tokens.json directly
+    let blocklist_path = std::path::Path::new("blocked_tokens.json");
+    if !blocklist_path.exists() {
+        return false;
+    }
+    
+    if let Ok(data) = std::fs::read_to_string(blocklist_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(blocked) = json.get("blocked").and_then(|b| b.as_object()) {
+                let token_lower = token.to_lowercase();
+                if let Some(entry) = blocked.get(&token_lower) {
+                    // Check expiry
+                    if let Some(expires_at) = entry.get("expires_at").and_then(|e| e.as_i64()) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as i64;
+                        if expires_at > now {
+                            let reason = entry.get("reason").and_then(|r| r.as_str()).unwrap_or("unknown");
+                            info!(token = %&token_lower[..12.min(token_lower.len())], reason, "🚫 Token in blocklist");
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -272,6 +320,46 @@ async fn get_token_info(client: &Client, token_address: &str) -> Option<DexPair>
             }
         }
         Err(e) => warn!(?e, "❌ DexScreener Error"),
+    }
+    None
+}
+
+/// Fetch on-chain quote from NAD.FUN Lens (isBuy=true)
+async fn fetch_lens_quote(
+    client: &Client,
+    rpc_url: &str,
+    token: Address,
+    amount_in: U256,
+) -> Option<U256> {
+    let call = getAmountOutCall {
+        token,
+        amountIn: amount_in,
+        isBuy: true,
+    };
+    let calldata = hex::encode(call.abi_encode());
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{
+            "to": NADFUN_LENS,
+            "data": format!("0x{}", calldata)
+        }, "latest"],
+        "id": 1
+    });
+
+    if let Ok(resp) = client.post(rpc_url).json(&body).send().await {
+        if let Ok(val) = resp.json::<serde_json::Value>().await {
+            if let Some(result) = val.get("result").and_then(|r| r.as_str()) {
+                if result.len() >= 130 {
+                    let bytes = hex::decode(&result[2..]).unwrap_or_default();
+                    if bytes.len() >= 64 {
+                        let amount_out = U256::from_be_slice(&bytes[32..64]);
+                        return Some(amount_out);
+                    }
+                }
+            }
+        }
     }
     None
 }
@@ -489,10 +577,14 @@ async fn main() -> Result<()> {
         .unwrap_or("40".to_string())
         .parse::<u8>()
         .unwrap();
-    let min_liquidity = env::var("MIN_LIQUIDITY_USD")
-        .unwrap_or("500".to_string())
-        .parse::<f64>()
-        .unwrap();
+    let min_liquidity = env::var("SNIPER_MIN_LIQ_USD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_MIN_LIQ_USD);
+    let liq_pct = env::var("SNIPER_LIQ_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_LIQ_PCT);
     let max_price_pump = env::var("MAX_PRICE_PUMP_1H")
         .unwrap_or("100".to_string())
         .parse::<f64>()
@@ -504,8 +596,26 @@ async fn main() -> Result<()> {
     let router_str = env::var("ROUTER_ADDRESS")
         .unwrap_or("0x6F6B8F1a20703309951a5127c45B49b1CD981A22".to_string());
     let router_address = Address::from_str(&router_str)?;
+    let slippage_bps = env::var("SNIPER_SLIPPAGE_BPS")
+        .ok()
+        .and_then(|v| v.parse::<u128>().ok())
+        .unwrap_or(DEFAULT_SLIPPAGE_BPS);
+    let bundle_min_count = env::var("SNIPER_BUNDLE_MIN_COUNT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_BUNDLE_MIN_COUNT);
+    let max_gas_gwei = env::var("SNIPER_MAX_GAS_GWEI")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_GAS_GWEI);
+    let rpc_http_url = env::var("MONAD_RPC_URL").expect("Brak MONAD_RPC_URL");
+    let dev_wallets: HashSet<Address> = env::var("DEV_WALLETS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| Address::from_str(s.trim()).ok())
+        .collect();
 
-    info!(wallet = %bot_address, whale_min, whale_max, min_score, min_liquidity, max_price_pump, wait_for_dex_sec, "Configuration loaded");
+    info!(wallet = %bot_address, whale_min, whale_max, min_score, min_liquidity, liq_pct, max_price_pump, wait_for_dex_sec, slippage_bps, bundle_min_count, max_gas_gwei, dev_wallets = dev_wallets.len(), "Configuration loaded");
     info!("🔌 Connecting to WebSocket...");
 
     let provider = ProviderBuilder::new()
@@ -542,6 +652,9 @@ async fn main() -> Result<()> {
             .get_block_by_number(block_number.into(), BlockTransactionsKind::Full)
             .await
         {
+            // Bundle detection per block
+            let mut bundle_stats: HashMap<String, HashSet<Address>> = HashMap::new();
+
             if let Some(txs) = block.transactions.as_transactions() {
                 for tx in txs {
                     let tx_hash = tx.inner.tx_hash();
@@ -564,6 +677,13 @@ async fn main() -> Result<()> {
 
                                 if let Some((name, symbol)) = decode_create_token_params(input) {
                                     info!(name = %name, symbol = %symbol, "📝 Token info");
+
+                                    // Dev wallet block
+                                    if dev_wallets.contains(&creator) {
+                                        warn!(creator = %&creator_str[..12], "🚫 DEV WALLET token - skipping");
+                                        tokens_skipped += 1;
+                                        continue;
+                                    }
 
                                     // Update creator stats
                                     {
@@ -632,6 +752,28 @@ async fn main() -> Result<()> {
                                         let token_addr_str = format!("{:?}", addr);
 
                                         info!(token = %&token_addr_str[..12], "📍 Token address found");
+
+                                        // Anti-bundle per block: skip if many buyers hit same token
+                                        let buyers = bundle_stats
+                                            .entry(token_addr_str.clone())
+                                            .or_insert_with(HashSet::new);
+                                        buyers.insert(tx.from);
+                                        if buyers.len() as u32 >= bundle_min_count {
+                                            warn!(
+                                                token = %&token_addr_str[..12],
+                                                count = buyers.len(),
+                                                "🚫 SKIP: Bundle cluster detected in block"
+                                            );
+                                            tokens_skipped += 1;
+                                            continue;
+                                        }
+
+                                        // Risk block check
+                                        if is_risk_blocked(&token_addr_str).await {
+                                            warn!(token = %&token_addr_str[..12], "🚫 RISK BLOCKED - skipping buy");
+                                            tokens_skipped += 1;
+                                            continue;
+                                        }
 
                                         // 5. DexScreener analysis with enhanced data
                                         debug!("🔍 Checking DexScreener...");
@@ -713,13 +855,46 @@ async fn main() -> Result<()> {
                                             whale_min,
                                             whale_max,
                                         )
-                                        .min(1.0); // MAX 1 MON
+                                        .min(liquidity_usd * liq_pct) // cap by liq
+                                        .min(1.0); // hard cap
 
                                         if amount_mon > 0.0 && final_score >= min_score {
+                                            // Gas guard
+                                            let gas_price =
+                                                provider.get_gas_price().await.unwrap_or_default();
+                                            let gas_gwei = gas_price / 1_000_000_000;
+                                            if gas_gwei > max_gas_gwei.into() {
+                                                warn!(
+                                                    gas = gas_gwei,
+                                                    max = max_gas_gwei,
+                                                    "⛽ Gas too high, skip buy"
+                                                );
+                                                tokens_skipped += 1;
+                                                continue;
+                                            }
+
                                             info!(amount_mon, "🐟 Executing buy");
 
                                             let amount_wei =
                                                 U256::from((amount_mon * 1e18) as u128);
+                                            // Quote via Lens for slippage protection
+                                            let min_out = if let Some(quote) = fetch_lens_quote(
+                                                &http_client,
+                                                &rpc_http_url,
+                                                addr,
+                                                amount_wei,
+                                            )
+                                            .await
+                                            {
+                                                quote.saturating_mul(U256::from(
+                                                    10_000u128 - slippage_bps,
+                                                )) / U256::from(10_000u128)
+                                            } else {
+                                                warn!("⚠️ No Lens quote, skipping trade");
+                                                tokens_skipped += 1;
+                                                continue;
+                                            };
+
                                             let deadline = U256::from(
                                                 SystemTime::now()
                                                     .duration_since(UNIX_EPOCH)
@@ -733,7 +908,7 @@ async fn main() -> Result<()> {
                                             // Correct ABI encoding with tuple struct
                                             // ═══════════════════════════════════════════════════════════════
                                             let buy_params = BuyParams {
-                                                amountOutMin: U256::ZERO, // Accept any amount (100% slippage)
+                                                amountOutMin: min_out,
                                                 token: addr,
                                                 to: bot_address,
                                                 deadline,
@@ -802,27 +977,22 @@ async fn main() -> Result<()> {
                                                                     gas_used = receipt.gas_used,
                                                                     "❌ TX FAILED! (wasted MON!)"
                                                                 );
-                                                                error!("🛑 EMERGENCY STOP - BOT ZATRZYMANY ABY NIE STRACIĆ WIĘCEJ MON!");
-                                                                std::process::exit(1);
-                                                                // STOP immediately after first failure!
+                                                                tokens_skipped += 1;
                                                             }
                                                         }
                                                         Ok(Err(e)) => {
                                                             error!(?e, "❌ Receipt error");
-                                                            error!("🛑 EMERGENCY STOP");
-                                                            std::process::exit(1);
+                                                            tokens_skipped += 1;
                                                         }
                                                         Err(_) => {
                                                             error!("⏱️ Receipt timeout (30s)");
-                                                            error!("🛑 EMERGENCY STOP");
-                                                            std::process::exit(1);
+                                                            tokens_skipped += 1;
                                                         }
                                                     }
                                                 }
                                                 Err(e) => {
                                                     error!(?e, "❌ TX send error");
-                                                    error!("🛑 EMERGENCY STOP");
-                                                    std::process::exit(1);
+                                                    tokens_skipped += 1;
                                                 }
                                             }
                                         } else {
