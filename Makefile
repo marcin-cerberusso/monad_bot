@@ -19,3 +19,28 @@ clean:
 	cargo clean
 	find . -name "*.pyc" -delete
 	find . -name "__pycache__" -type d -delete
+
+# ============================================================================
+# Bot management
+# ============================================================================
+.PHONY: run run-bg stop logs status
+
+run:
+	.venv/bin/python3 run_agents.py
+
+run-bg:
+	mkdir -p logs
+	nohup .venv/bin/python3 run_agents.py > logs/bot.log 2>&1 & echo $$! > bot.pid
+
+stop:
+	@if [ -f bot.pid ]; then kill $$(cat bot.pid) 2>/dev/null; rm -f bot.pid; echo "Bot stopped"; fi
+
+logs:
+	tail -f logs/monad_bot.log
+
+status:
+	@if [ -f bot.pid ] && kill -0 $$(cat bot.pid) 2>/dev/null; then \
+		echo "✅ Bot running (PID: $$(cat bot.pid))"; \
+	else \
+		echo "❌ Bot not running"; rm -f bot.pid 2>/dev/null; \
+	fi

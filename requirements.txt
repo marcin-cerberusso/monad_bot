@@ -1,0 +1,5 @@
+web3
+python-dotenv
+aiohttp
+websockets
+redis

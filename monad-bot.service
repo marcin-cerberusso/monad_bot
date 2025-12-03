@@ -1,0 +1,47 @@
+[Unit]
+Description=MONAD Trading Bot - Multi-Agent AI Trading System
+Documentation=https://github.com/user/monad-bot
+After=network.target redis.service
+Wants=redis.service
+
+[Service]
+Type=simple
+User=marcin
+Group=marcin
+WorkingDirectory=/home/marcin/windsurf/copydevawwallet/solana-trading-bot/monad_engine
+
+# Environment setup
+Environment="PATH=/home/marcin/windsurf/copydevawwallet/solana-trading-bot/monad_engine/.venv/bin:/usr/bin:/bin"
+Environment="VIRTUAL_ENV=/home/marcin/windsurf/copydevawwallet/solana-trading-bot/monad_engine/.venv"
+Environment="PYTHONUNBUFFERED=1"
+
+# Execute the supervisor script which handles auto-restart internally
+ExecStart=/home/marcin/windsurf/copydevawwallet/solana-trading-bot/monad_engine/monad_bot.sh
+
+# Restart configuration
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Logging
+StandardOutput=append:/var/log/monad-bot/monad-bot.log
+StandardError=append:/var/log/monad-bot/monad-bot-error.log
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/marcin/windsurf/copydevawwallet/solana-trading-bot/monad_engine/logs
+ReadWritePaths=/var/log/monad-bot
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+# Resource limits
+MemoryMax=2G
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target
