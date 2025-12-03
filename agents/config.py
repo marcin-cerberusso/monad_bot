@@ -36,10 +36,11 @@ def setup_logging(name: str = "monad_bot") -> logging.Logger:
         '%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s'
     )
     
-    # Console handler (INFO and above)
+    # Console handler (INFO and above) - with immediate flush
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
+    console_handler.stream.reconfigure(line_buffering=True) if hasattr(console_handler.stream, 'reconfigure') else None
     logger.addHandler(console_handler)
     
     # Main file handler with rotation (10MB max, 5 backups)

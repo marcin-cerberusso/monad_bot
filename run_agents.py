@@ -9,6 +9,9 @@ Usage:
 import sys
 import os
 
+# Force unbuffered output for logging
+os.environ['PYTHONUNBUFFERED'] = '1'
+
 # Add agents to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
