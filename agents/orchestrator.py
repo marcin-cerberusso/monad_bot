@@ -13,7 +13,6 @@ from .risk_agent import RiskAgent
 from .ai_agent import AIAgent
 from .trader_agent import TraderAgent
 from .position_agent import PositionAgent
-from .leverage_agent import LeverageAgent, LeverageConfig
 
 load_dotenv()
 
@@ -34,13 +33,8 @@ class Orchestrator:
             RiskAgent(REDIS_URL),
             AIAgent(REDIS_URL),
             TraderAgent(REDIS_URL),
-            PositionAgent(REDIS_URL),
+            PositionAgent(REDIS_URL)
         ]
-        
-        # LeverageAgent - opcjonalny, tylko gdy skonfigurowany
-        if LeverageConfig.ENABLED:
-            # LeverageAgent używa własnego message bus - dodamy go osobno
-            pass  # Na razie działa standalone przez AI signals
         
     async def start(self):
         """Uruchom wszystkich agentów"""
@@ -56,16 +50,12 @@ class Orchestrator:
         print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Redis: {REDIS_URL}")
         print(f"Agents: {len(self.agents)}")
-        print(f"Leverage: {'ENABLED (3x, min 85% confidence)' if LeverageConfig.ENABLED else 'DISABLED'}")
         print()
         
         for agent in self.agents:
             print(f"  ✅ {agent.name}")
-        if LeverageConfig.ENABLED:
-            print(f"  🔥 LeverageAgent (LeverUp {LeverageConfig.DEFAULT_LEVERAGE}x)")
         print()
         print("Flow: Whale -> Risk -> AI -> Trader -> Position")
-        print("      AI (85%+) -> Leverage (3x long)")
         print("="*60)
         print()
         
