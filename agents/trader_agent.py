@@ -14,6 +14,7 @@ from web3 import Web3
 from .base_agent import BaseAgent, Message, MessageTypes, Channels
 from .notifications import notifier
 from . import decision_logger
+from . import config
 
 load_dotenv()
 
@@ -24,7 +25,7 @@ WALLET = os.getenv("WALLET_ADDRESS", "0x7b2897EA9547a6BB3c147b3E262483ddAb132A7D
 POSITIONS_FILE = Path(__file__).resolve().parent.parent / "positions.json"
 BUY_SCRIPT = Path(__file__).resolve().parent.parent / "buy_token.py"
 SELL_SCRIPT = Path(__file__).resolve().parent.parent / "sell_token.py"
-MAX_FOLLOW_SIZE = float(os.getenv("FOLLOW_AMOUNT_MON", "20"))
+MAX_FOLLOW_SIZE = config.FOLLOW_AMOUNT_MON
 
 
 class TraderAgent(BaseAgent):

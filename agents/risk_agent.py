@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 from .base_agent import BaseAgent, Message, MessageTypes, Channels
 from . import decision_logger
+from . import config
 
 load_dotenv()
 
@@ -16,10 +17,10 @@ LENS = "0x7e78A8DE94f21804F7a17F4E8BF9EC2c872187ea"
 RPC_URL = os.getenv("MONAD_RPC_URL")
 CAST_PATH = os.path.expanduser("~/.foundry/bin/cast")
 
-# Risk thresholds
-MAX_TAX_PERCENT = 15  # Max acceptable tax
-MIN_LIQUIDITY_USD = 1000
-MAX_FOMO_PUMP_1H = 200  # Max +200% w 1h
+# Risk thresholds from central config
+MAX_TAX_PERCENT = config.MAX_TAX_PERCENT
+MIN_LIQUIDITY_USD = config.MIN_LIQUIDITY_USD
+MAX_FOMO_PUMP_1H = config.MAX_FOMO_PUMP_1H
 
 
 class RiskAgent(BaseAgent):

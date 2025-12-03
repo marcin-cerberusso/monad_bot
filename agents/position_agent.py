@@ -11,6 +11,7 @@ from typing import Dict, Optional
 from dotenv import load_dotenv
 
 from .base_agent import BaseAgent, Message, MessageTypes, Channels
+from . import config
 
 load_dotenv()
 
@@ -19,12 +20,14 @@ RPC_URL = os.getenv("MONAD_RPC_URL")
 CAST_PATH = os.path.expanduser("~/.foundry/bin/cast")
 POSITIONS_FILE = Path(__file__).resolve().parent.parent / "positions.json"
 
-# TP/SL settings
-TP1_PERCENT = 30   # Take 30% profit at +30%
-TP2_PERCENT = 60   # Take 40% more at +60%
-STOP_LOSS = -25    # Stop loss at -25%
-TRAILING_ACTIVATE = 40  # Activate trailing at +40%
-TRAILING_STOP = 15  # Trail by 15%
+# TP/SL settings from central config
+TP1_PERCENT = config.TP1_PERCENT
+TP1_SELL = config.TP1_SELL_PERCENT
+TP2_PERCENT = config.TP2_PERCENT
+TP2_SELL = config.TP2_SELL_PERCENT
+STOP_LOSS = config.STOP_LOSS_PERCENT
+TRAILING_ACTIVATE = config.TRAILING_ACTIVATE
+TRAILING_STOP = config.TRAILING_STOP
 
 
 class PositionAgent(BaseAgent):
@@ -105,7 +108,7 @@ class PositionAgent(BaseAgent):
         # TP1 (not taken yet)
         elif pnl_percent >= TP1_PERCENT and not pos.get("tp1_taken"):
             action = "sell"
-            percent_to_sell = 30
+            percent_to_sell = TP1_SELL
             reason = f"TP1 at +{pnl_percent:.1f}%"
             pos["tp1_taken"] = True
             self._save_position(token, pos)
@@ -113,7 +116,7 @@ class PositionAgent(BaseAgent):
         # TP2 (not taken yet)
         elif pnl_percent >= TP2_PERCENT and not pos.get("tp2_taken"):
             action = "sell"
-            percent_to_sell = 40
+            percent_to_sell = TP2_SELL
             reason = f"TP2 at +{pnl_percent:.1f}%"
             pos["tp2_taken"] = True
             self._save_position(token, pos)

@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 from .base_agent import BaseAgent, Message, MessageTypes, Channels
 from . import decision_logger
+from . import config
 
 load_dotenv()
 
