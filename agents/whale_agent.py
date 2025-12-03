@@ -1,5 +1,6 @@
 """
-🐳 WHALE AGENT - Wykrywa whale buys na NAD.FUN
+🐳 WHALE AGENT - Wykrywa whale buys I SELLS na NAD.FUN
+Kopiuje zakupy i sprzedaże wielorybów
 """
 import asyncio
 import json
@@ -17,7 +18,9 @@ load_dotenv()
 ROUTER = "0x6F6B8F1a20703309951a5127c45B49b1CD981A22"
 from .config import MIN_WHALE_BUY_MON as MIN_WHALE_SIZE
 
-
+# Function selectors dla routera
+SELL_SELECTOR = "0x6dcea85f"  # sell(address token, uint256 amount, ...)
+BUY_SELECTOR = "0xa6f2ae3a"   # buy(address token)
 class WhaleAgent(BaseAgent):
     """Agent wykrywający whale buys"""
     
@@ -70,7 +73,7 @@ class WhaleAgent(BaseAgent):
                     pass
     
     async def _check_tx(self, tx_hash: str):
-        """Sprawdź czy tx to whale buy"""
+        """Sprawdź czy tx to whale buy LUB SELL"""
         try:
             tx = await self._get_tx(tx_hash)
             if not tx:
@@ -80,6 +83,15 @@ class WhaleAgent(BaseAgent):
             if to != ROUTER.lower():
                 return
             
+            input_data = tx.get("input", "")
+            whale = tx.get("from", "").lower()
+            
+            # Sprawdź czy to SELL (sprzedaż tokena za MON)
+            if input_data.startswith(SELL_SELECTOR):
+                await self._handle_whale_sell(tx, tx_hash, whale, input_data)
+                return
+            
+            # Sprawdź czy to BUY (kupno tokena za MON)
             value_hex = tx.get("value", "0x0")
             value_mon = int(value_hex, 16) / 1e18
             
@@ -87,11 +99,10 @@ class WhaleAgent(BaseAgent):
                 return
             
             # Extract token from input
-            token = self._extract_token(tx.get("input", ""))
+            token = self._extract_token(input_data)
             if not token:
                 return
             
-            whale = tx.get("from", "").lower()
             self.whales_seen += 1
             
             self.log(f"🐳 WHALE BUY: {value_mon:.1f} MON -> {token[:12]}...")
@@ -101,12 +112,13 @@ class WhaleAgent(BaseAgent):
                 "token": token,
                 "whale": whale,
                 "amount_mon": value_mon,
-                "tx_hash": tx_hash
+                "tx_hash": tx_hash,
+                "action": "buy"
             })
             
             # Notify
             await self.notify(
-                "🐳 Whale Detected",
+                "🐳 Whale BUY",
                 f"Whale bought {value_mon:.1f} MON of {token}\nTx: {tx_hash}",
                 0x00FFFF  # Cyan
             )
@@ -125,6 +137,46 @@ class WhaleAgent(BaseAgent):
             
         except Exception as e:
             pass
+    
+    async def _handle_whale_sell(self, tx: dict, tx_hash: str, whale: str, input_data: str):
+        """Obsłuż SPRZEDAŻ wieloryba - wyślij sygnał do PositionAgent"""
+        try:
+            # Extract token from sell calldata
+            token = self._extract_token(input_data)
+            if not token:
+                return
+            
+            self.log(f"🔴 WHALE SELL: {whale[:10]}... selling {token[:12]}...")
+            
+            # Log for ML
+            decision_logger.log_whale_signal({
+                "token": token,
+                "whale": whale,
+                "tx_hash": tx_hash,
+                "action": "sell"
+            })
+            
+            # Notify
+            await self.notify(
+                "🔴 Whale SELL",
+                f"Whale is SELLING {token}\nFollow and exit!",
+                0xFF0000  # Red
+            )
+            
+            # Send directly to PositionAgent - natychmiast sprzedaj!
+            await self.publish(Channels.POSITION, Message(
+                type=MessageTypes.WHALE_SELL,
+                data={
+                    "token": token,
+                    "whale": whale,
+                    "tx_hash": tx_hash,
+                    "reason": "whale_exit"
+                },
+                sender=self.name
+            ))
+            
+        except Exception as e:
+            self.log(f"Error handling whale sell: {e}")
     
     async def _get_tx(self, tx_hash: str) -> Optional[dict]:
         """Get transaction"""

@@ -173,6 +173,7 @@ class BaseAgent(ABC):
 # Typy wiadomości
 class MessageTypes:
     WHALE_BUY = "whale_buy"
+    WHALE_SELL = "whale_sell"  # Wieloryb sprzedaje - kopiuj!
     RISK_CHECK = "risk_check"
     RISK_RESULT = "risk_result"
     AI_ANALYZE = "ai_analyze"

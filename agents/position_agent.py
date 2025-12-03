@@ -53,6 +53,13 @@ class PositionAgent(BaseAgent):
         """Handle position updates"""
         if message.type == MessageTypes.TRADE_EXECUTED:
             self.log(f"Trade executed: {message.data.get('action')} {message.data.get('token', '')[:12]}...")
+        
+        # === WHALE SELL - natychmiast sprzedaj pozycję! ===
+        elif message.type == MessageTypes.WHALE_SELL:
+            token = message.data.get("token", "").lower()
+            whale = message.data.get("whale", "")[:10]
+            self.log(f"🔴 WHALE EXIT: {whale}... selling {token[:12]} - following!")
+            await self._emergency_sell_token(token, reason="whale_exit")
     
     async def _check_positions(self):
         """Check all positions for TP/SL"""
@@ -193,6 +200,42 @@ class PositionAgent(BaseAgent):
                 json.dump(positions, f, indent=2)
         except:
             pass
+    
+    async def _emergency_sell_token(self, token: str, reason: str = "whale_exit"):
+        """Natychmiastowa sprzedaż tokena - whale exit!"""
+        positions = self._load_positions()
+        token_lower = token.lower()
+        
+        if token_lower not in positions:
+            self.log(f"  No position in {token[:12]} to sell")
+            return
+        
+        pos = positions[token_lower]
+        self.log(f"🚨 EMERGENCY SELL: {token[:12]}... (reason: {reason})")
+        
+        # Wyślij SELL_ORDER do TraderAgent
+        await self.publish(Channels.TRADER, Message(
+            type=MessageTypes.SELL_ORDER,
+            data={
+                "token": token,
+                "sell_percent": 100,  # Sprzedaj wszystko!
+                "reason": reason,
+                "position": pos
+            },
+            sender=self.name
+        ))
+        
+        # Usuń pozycję
+        del positions[token_lower]
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(positions, f, indent=2)
+        
+        # Notify
+        await self.notify(
+            "🚨 WHALE EXIT - Sold!",
+            f"Following whale - sold 100% of {token[:16]}",
+            0xFF0000  # Red
+        )
 
 
 if __name__ == "__main__":
