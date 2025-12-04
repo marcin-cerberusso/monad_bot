@@ -13,7 +13,7 @@ from web3 import Web3
 
 from .base_agent import BaseAgent, Message, MessageTypes, Channels
 from .notifications import get_notifier
-
+from . import config
 from . import decision_logger
 from .smart_agent import SmartTradingAgent
 
@@ -189,11 +189,22 @@ class TraderAgent(BaseAgent):
             pass
         return {}
     
-    def _save_position(self, token: str, data: dict):
-        """Save position"""
+    def _save_position(self, token: str, amount_mon: float, whale: str, 
+                        confidence: float = 0.5, smart_action: str = "buy"):
+        """Save position with proper fields"""
         try:
             positions = self._load_positions()
-            positions[token.lower()] = data
+            positions[token.lower()] = {
+                "token": token.lower(),
+                "amount_mon": amount_mon,
+                "entry_value": amount_mon,  # For PnL calculation
+                "entry_time": datetime.now().isoformat(),
+                "tx_hash": "success",
+                "whale": whale,
+                "ai_confidence": confidence,
+                "smart_action": smart_action,
+                "liquidity_usd": 0
+            }
             with open(POSITIONS_FILE, "w") as f:
                 json.dump(positions, f, indent=2)
         except Exception as e:

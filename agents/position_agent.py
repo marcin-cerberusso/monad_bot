@@ -3,25 +3,23 @@
 """
 import asyncio
 import json
+import aiohttp
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from web3 import Web3
 
-from .base_agent import BaseAgent, Message, MessageType
+from .base_agent import BaseAgent, Message, MessageTypes, Channels
 from . import config
+from .notifications import get_notifier
 
 
-LENS = "0x7e78A8DE94f21804F7a17F4E8BF9EC2c872187ea"
-RPC_URL = config.MONAD_RPC_URL
-CAST_PATH = config.CAST_PATH
+RPC_URL = "https://monad-mainnet.g.alchemy.com/v2/FPgsxxE5R86qHQ200z04i"
 POSITIONS_FILE = Path(__file__).resolve().parent.parent / "positions.json"
 
-# TP/SL settings
-TP1_PERCENT = 30   # Take 30% profit at +30%
-TP2_PERCENT = 60   # Take 40% more at +60%
-STOP_LOSS = -25    # Stop loss at -25%
-TRAILING_ACTIVATE = 40  # Activate trailing at +40%
-TRAILING_STOP = 15  # Trail by 15%
+# NAD.FUN Lens for sell quotes
+LENS = "0x7e78A8DE94f21804F7a17F4E8BF9EC2c872187ea"
+ROUTER = "0x6F6B8F1a20703309951a5127c45B49b1CD981A22"
 
 
 class PositionAgent(BaseAgent):
@@ -57,8 +55,8 @@ class PositionAgent(BaseAgent):
                 
             for token, pos in list(positions.items()):
                 try:
-                    # Get current price from NAD.FUN
-                    current_value = await self._get_token_value(token, pos.get('amount', 0))
+                    # Get current price from NAD.FUN (pass pos for fallback)
+                    current_value = await self._get_token_value(token, pos.get('amount', 0), pos)
                     entry_value = pos.get('entry_value', pos.get('amount_mon', 0))
                     
                     if entry_value <= 0:
@@ -118,7 +116,7 @@ class PositionAgent(BaseAgent):
                     # Execute sell if triggered
                     if action and sell_percent > 0:
                         await self.publish("monad:trader", Message(
-                            type=MessageType.SELL_ORDER,
+                            type=MessageTypes.SELL_ORDER,
                             data={
                                 "token": token,
                                 "percent": sell_percent,
@@ -126,8 +124,18 @@ class PositionAgent(BaseAgent):
                                 "action": action,
                                 "pnl_percent": pnl_percent
                             },
-                            source="position_agent"
+                            sender="position_agent"
                         ))
+                        
+                        # Send notification
+                        notifier = get_notifier()
+                        await notifier.send_position_alert(
+                            token=token,
+                            action=action,
+                            pnl=pnl_percent,
+                            sell_percent=sell_percent,
+                            reason=reason
+                        )
                     
                     # Save updated position
                     self._save_positions(positions)
@@ -138,42 +146,81 @@ class PositionAgent(BaseAgent):
         except Exception as e:
             self.log(f"Error in _check_positions: {e}")
     
-    async def _get_token_value(self, token: str, amount: float) -> float:
-        """Get current MON value of token holdings using NAD.FUN Lens"""
+    async def _get_token_value(self, token: str, amount: float, pos: dict = None) -> float:
+        """
+        Get current MON value of token holdings.
+        
+        For NAD.FUN tokens, the price depends on bonding curve state.
+        Since Lens calls may fail, we use entry value as fallback.
+        """
+        entry_value = 0
+        if pos:
+            entry_value = pos.get('entry_value', pos.get('amount_mon', 0))
+        
         try:
-            import subprocess
+            # Connect to Monad
+            w3 = Web3(Web3.HTTPProvider(RPC_URL))
             
-            # NAD.FUN Lens contract for price queries
-            LENS = "0x7e78A8DE94f21804F7a17F4E8BF9EC2c872187ea"
-            RPC = "https://monad-mainnet.g.alchemy.com/v2/FPgsxxE5R86qHQ200z04i"
+            # Get token balance
+            amount_wei = int(amount * 10**18) if amount > 0 else 0
             
-            # Convert amount to wei (18 decimals)
-            amount_wei = int(amount * 10**18)
+            if amount_wei <= 0 and pos:
+                # Try to get actual balance from blockchain
+                try:
+                    token_contract = w3.eth.contract(
+                        address=Web3.to_checksum_address(token),
+                        abi=[{"constant":True,"inputs":[{"name":"account","type":"address"}],
+                              "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"}]
+                    )
+                    # Get our wallet
+                    wallet = "0x7b2897EA9547a6BB3c147b3E262483ddAb132A7D"
+                    amount_wei = token_contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
+                except:
+                    pass
             
-            # Call getAmountOut on Lens
-            result = subprocess.run([
-                "cast", "call", LENS,
-                f"getAmountOut(address,uint256,bool)(uint256)",
-                token, str(amount_wei), "true",  # true = selling tokens for MON
-                "--rpc-url", RPC
-            ], capture_output=True, text=True, timeout=10)
+            if amount_wei <= 0:
+                # No tokens to price - return entry value
+                return entry_value
             
-            if result.returncode == 0 and result.stdout.strip():
-                mon_wei = int(result.stdout.strip())
-                return mon_wei / 10**18
+            # === Try Lens getSellQuote ===
+            # getSellQuote(address,uint256) -> returns (uint256 monOut, uint256 fee)
+            method_id = "0x9c3e8f47"
+            token_padded = token.lower().replace('0x', '').zfill(64)
+            amount_padded = hex(amount_wei)[2:].zfill(64)
+            calldata = method_id + token_padded + amount_padded
+            
+            try:
+                result = w3.eth.call({
+                    'to': Web3.to_checksum_address(LENS),
+                    'data': bytes.fromhex(calldata)
+                })
+                
+                if result and len(result) >= 32:
+                    mon_wei = int(result[:32].hex(), 16)
+                    if mon_wei > 0:
+                        value = mon_wei / 10**18
+                        self.log(f"💰 {token[:10]}... value: {value:.4f} MON (from Lens)")
+                        return value
+            except Exception as e:
+                pass  # Lens failed, try fallback
+            
+            # === Fallback: use entry value ===
+            # When Lens fails (token might be dead/graduated), assume entry value
+            if entry_value > 0:
+                self.log(f"⚠️ Using entry value for {token[:10]}... ({entry_value:.2f} MON)")
+                return entry_value
             
             return 0
             
         except Exception as e:
-            self.log(f"Error getting token value: {e}")
-            return 0
+            self.log(f"⚠️ Price check failed for {token[:10]}...: {e}")
+            return entry_value if entry_value > 0 else 0
     
     def _load_positions(self) -> dict:
         """Load positions from file"""
         try:
-            positions_file = Path("data/positions.json")
-            if positions_file.exists():
-                with open(positions_file) as f:
+            if POSITIONS_FILE.exists():
+                with open(POSITIONS_FILE) as f:
                     return json.load(f)
             return {}
         except Exception as e:
@@ -183,10 +230,11 @@ class PositionAgent(BaseAgent):
     def _save_positions(self, positions: dict):
         """Save positions to file"""
         try:
-            positions_file = Path("data/positions.json")
-            positions_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(positions_file, 'w') as f:
+            POSITIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(POSITIONS_FILE, 'w') as f:
                 json.dump(positions, f, indent=2, default=str)
+        except Exception as e:
+            self.log(f"Error saving positions: {e}")
         except Exception as e:
             self.log(f"Error saving positions: {e}")
 

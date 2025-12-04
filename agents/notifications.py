@@ -194,6 +194,28 @@ class TelegramNotifier:
 """
         await self.send(msg)
     
+    async def send_position_alert(self, token: str, action: str, pnl: float, 
+                                   sell_percent: float, reason: str):
+        """Notify about TP/SL triggers (alias for notify_position_update with more details)"""
+        emoji_map = {
+            "TP1": "💰",
+            "TP2": "💰💰",
+            "STOP_LOSS": "🛑",
+            "TRAILING_STOP": "🎯"
+        }
+        emoji = emoji_map.get(action, "📊")
+        
+        msg = f"""
+{emoji} <b>{action} TRIGGERED</b>
+
+🪙 Token: <code>{token[:16]}...</code>
+💵 PnL: <code>{pnl:+.1f}%</code>
+📊 Selling: <code>{sell_percent}%</code>
+📝 Reason: {reason}
+⏰ Time: {datetime.now().strftime('%H:%M:%S')}
+"""
+        await self.send(msg)
+    
     async def notify_error(self, error: str, context: str = ""):
         """Notify about errors"""
         msg = f"""
