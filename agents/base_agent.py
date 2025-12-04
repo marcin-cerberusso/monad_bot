@@ -62,13 +62,17 @@ class BaseAgent(ABC):
         """Połącz z Redis/Dragonfly lub użyj in-memory"""
         try:
             import redis.asyncio as redis_lib
-            self.redis = await redis_lib.from_url(self.redis_url)
+            # For rediss:// (SSL) URLs, disable cert verification for Dragonfly
+            if self.redis_url.startswith("rediss://"):
+                self.redis = await redis_lib.from_url(self.redis_url, ssl_cert_reqs=None)
+            else:
+                self.redis = await redis_lib.from_url(self.redis_url)
             await self.redis.ping()
             self.pubsub = self.redis.pubsub()
             self.use_redis = True
             self.log("Connected to Redis")
         except Exception as e:
-            self.log(f"Redis unavailable, using in-memory bus")
+            self.log(f"Redis unavailable ({e}), using in-memory bus")
             self.use_redis = False
     
     async def disconnect(self):
@@ -138,10 +142,15 @@ class BaseAgent(ABC):
         await self.connect()
         self.log("Starting...")
         
-        # Uruchom listener, run i heartbeat równolegle
+        # Run first to let agent subscribe, then start listener
+        # Create tasks but start run first
+        run_task = asyncio.create_task(self.run())
+        await asyncio.sleep(0.1)  # Give run() time to subscribe
+        
+        # Now start listener and heartbeat
         await asyncio.gather(
             self.listen(),
-            self.run(),
+            run_task,
             self._heartbeat_loop()
         )
     
@@ -173,7 +182,6 @@ class BaseAgent(ABC):
 # Typy wiadomości
 class MessageTypes:
     WHALE_BUY = "whale_buy"
-    WHALE_SELL = "whale_sell"  # Wieloryb sprzedaje - kopiuj!
     RISK_CHECK = "risk_check"
     RISK_RESULT = "risk_result"
     AI_ANALYZE = "ai_analyze"

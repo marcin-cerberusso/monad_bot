@@ -55,6 +55,7 @@ reqwest = { version = "0.12", features = ["json", "blocking"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures = "0.3"
+futures-util = "0.3"
 hex = "0.4"
 dexscreener = "0.2"
 # redis removed - using file-based blocklist

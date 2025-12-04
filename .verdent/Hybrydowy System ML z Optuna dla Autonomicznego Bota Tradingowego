@@ -1,0 +1,1167 @@
+# Hybrydowy System ML z Optuna dla Autonomicznego Bota Tradingowego
+
+## Przegląd Architektury
+
+System oparty na podejściu "Jesse-style" z Optuna, dostosowany do środowiska DEX (Monad/NAD.FUN):
+
+- **Execution Layer:** Rust (copy_trader, mempool_sniper) + Python (smart_agent)
+- **Optimization:** Optuna (hyperparameter tuning zamiast RL)
+- **ML Inference:** XGBoost → ONNX → Rust
+- **NLP:** DistilBERT mikroserwis
+- **Cache/Features:** DragonflyDB
+
+```mermaid
+graph TB
+    subgraph "Faza 1: Zbieranie Danych"
+        BOT[Trading Bot] --> LOG[Enhanced Logger]
+        LOG --> DB[(ml_training.db)]
+        LOG --> MISSED[Missed Opportunities]
+    end
+    
+    subgraph "Faza 2: Optymalizacja"
+        DB --> OPT[Optuna Optimizer]
+        OPT --> PARAMS[Best Parameters]
+        PARAMS --> REDIS[(DragonflyDB)]
+    end
+    
+    subgraph "ML Pipeline"
+        DB --> TRAIN[XGBoost Training]
+        TRAIN --> ONNX[ONNX Export]
+        ONNX --> RUST[Rust Inference]
+    end
+    
+    subgraph "NLP Pipeline"
+        TW[Twitter] --> NLP[Sentiment Service]
+        TG[Telegram] --> NLP
+        NLP --> REDIS
+    end
+    
+    REDIS --> BOT
+    RUST --> BOT
+```
+
+---
+
+## Faza 1: Enhanced Data Collection
+
+### 1.1 Rozszerzony Schemat Danych
+
+**Cel:** Zbierać nie tylko wykonane trade'y, ale też **pominięte okazje** z pełnym kontekstem rynkowym, aby później móc symulować "co by było gdyby".
+
+**Lokalizacja:** `data/ml_training.db`
+
+```sql
+CREATE TABLE signals (
+    id INTEGER PRIMARY KEY,
+    timestamp REAL NOT NULL,
+    
+    -- Token Info
+    token_address TEXT NOT NULL,
+    token_symbol TEXT,
+    
+    -- Market Snapshot (w momencie sygnału)
+    mcap_usd REAL,
+    volume_24h REAL,
+    liquidity_usd REAL,
+    holders INTEGER,
+    price_at_signal REAL,
+    price_change_1h REAL,
+    price_change_24h REAL,
+    
+    -- Whale Info (jeśli copy trade)
+    whale_address TEXT,
+    whale_amount_mon REAL,
+    whale_trust_score REAL,
+    
+    -- AI/Sentiment
+    ai_score REAL,
+    sentiment_score REAL,
+    
+    -- Trigger
+    trigger_type TEXT,  -- 'whale_copy', 'snipe', 'ai_signal'
+    signal_source TEXT, -- 'copy_trader', 'mempool_sniper', 'smart_agent'
+    
+    -- Decision
+    action_taken TEXT,  -- 'buy', 'skip', 'hold'
+    skip_reason TEXT,   -- jeśli skip: 'low_confidence', 'high_tax', etc.
+    confidence_score REAL,
+    
+    -- Position (jeśli buy)
+    entry_price REAL,
+    position_size_mon REAL,
+    
+    -- Outcome Tracking (aktualizowane po fakcie)
+    potential_high REAL,      -- Najwyższa cena w ciągu 1h po sygnale
+    potential_low REAL,       -- Najniższa cena w ciągu 1h po sygnale
+    price_after_5min REAL,
+    price_after_15min REAL,
+    price_after_1h REAL,
+    
+    -- Jeśli trade został wykonany
+    exit_price REAL,
+    exit_timestamp REAL,
+    exit_reason TEXT,         -- 'tp1', 'tp2', 'sl', 'trailing', 'manual'
+    pnl_percent REAL,
+    hold_time_seconds INTEGER,
+    
+    -- Metadata
+    params_version TEXT,      -- Wersja parametrów używanych przy decyzji
+    created_at REAL DEFAULT (strftime('%s', 'now'))
+);
+
+CREATE INDEX idx_signals_timestamp ON signals(timestamp);
+CREATE INDEX idx_signals_token ON signals(token_address);
+CREATE INDEX idx_signals_action ON signals(action_taken);
+CREATE INDEX idx_signals_pnl ON signals(pnl_percent);
+```
+
+### 1.2 Enhanced Data Collector
+
+**Lokalizacja:** `ml/data_collector.py`
+
+```python
+class EnhancedDataCollector:
+    """
+    Zbiera pełny kontekst dla każdego sygnału tradingowego.
+    Kluczowe: loguje WSZYSTKIE sygnały, nie tylko wykonane trade'y.
+    """
+    
+    def __init__(self, db_path: str, redis_url: str):
+        self.db = sqlite3.connect(db_path)
+        self.redis = redis.from_url(redis_url)
+        self._init_db()
+        
+    async def log_signal(self, signal_data: dict) -> int:
+        """
+        Loguje każdy sygnał z pełnym kontekstem.
+        Zwraca signal_id do późniejszej aktualizacji outcome.
+        """
+        
+    async def update_outcome(self, signal_id: int, outcome_data: dict):
+        """
+        Aktualizuje sygnał o rzeczywisty wynik.
+        Wywoływane przez background task po 5min, 15min, 1h.
+        """
+        
+    async def log_trade_exit(self, signal_id: int, exit_data: dict):
+        """
+        Loguje zamknięcie pozycji z finalnym PnL.
+        """
+```
+
+### 1.3 Outcome Tracker (Background Task)
+
+**Lokalizacja:** `ml/outcome_tracker.py`
+
+**Cel:** Dla każdego sygnału (wykonanego lub nie), śledzi cenę tokena po 5min, 15min, 1h, aby później móc policzyć "potential PnL".
+
+```python
+class OutcomeTracker:
+    """
+    Background task śledzący ceny tokenów po sygnałach.
+    Pozwala odpowiedzieć: "Co by było gdybym kupił ten token?"
+    """
+    
+    def __init__(self, db_path: str, dexscreener_api: str):
+        self.db = sqlite3.connect(db_path)
+        self.pending_checks = []  # [(signal_id, token, check_time, check_type)]
+        
+    async def schedule_checks(self, signal_id: int, token: str):
+        """Planuje sprawdzenie ceny po 5min, 15min, 1h"""
+        now = time.time()
+        self.pending_checks.extend([
+            (signal_id, token, now + 300, '5min'),
+            (signal_id, token, now + 900, '15min'),
+            (signal_id, token, now + 3600, '1h'),
+        ])
+        
+    async def run_checker_loop(self):
+        """Główna pętla sprawdzająca ceny"""
+        while True:
+            now = time.time()
+            due_checks = [c for c in self.pending_checks if c[2] <= now]
+            
+            for signal_id, token, _, check_type in due_checks:
+                price = await self._fetch_price(token)
+                await self._update_signal(signal_id, check_type, price)
+                
+            self.pending_checks = [c for c in self.pending_checks if c[2] > now]
+            await asyncio.sleep(10)
+```
+
+---
+
+## Faza 2: Optuna Strategy Optimizer
+
+### 2.1 Architektura Optimizera
+
+**Inspiracja:** Jesse framework używa Optuna do optymalizacji hyperparametrów strategii.
+
+**Nasze podejście:** Replay-based backtest na zebranych danych z symulacją różnych parametrów.
+
+**Lokalizacja:** `ml/optimizer.py`
+
+### 2.2 Search Space (Parametry do Optymalizacji)
+
+| Parametr | Typ | Min | Max | Opis |
+|----------|-----|-----|-----|------|
+| `stop_loss` | float | 0.05 | 0.35 | Stop loss jako % od entry |
+| `take_profit_1` | float | 0.15 | 0.50 | Pierwszy TP |
+| `take_profit_2` | float | 0.40 | 1.50 | Drugi TP |
+| `trailing_activate` | float | 0.20 | 0.60 | Kiedy aktywować trailing |
+| `trailing_distance` | float | 0.08 | 0.25 | Odległość trailing stop |
+| `min_confidence` | float | 0.40 | 0.85 | Minimalny confidence do wejścia |
+| `min_liquidity` | float | 500 | 10000 | Minimalna liquidity USD |
+| `max_mcap` | float | 100000 | 5000000 | Maksymalny mcap USD |
+| `position_size_base` | float | 5.0 | 30.0 | Bazowy rozmiar pozycji MON |
+| `whale_trust_threshold` | float | 0.3 | 0.7 | Min trust score whale'a |
+
+### 2.3 Replay-Based Backtest Engine
+
+**Lokalizacja:** `ml/backtest_engine.py`
+
+```python
+class ReplayBacktester:
+    """
+    Symuluje strategię na historycznych sygnałach.
+    Używa zapisanych potential_high/low do określenia outcome.
+    """
+    
+    def __init__(self, db_path: str):
+        self.db = sqlite3.connect(db_path)
+        
+    def load_signals(self, min_date: float = None) -> pd.DataFrame:
+        """Ładuje sygnały z pełnym kontekstem"""
+        query = """
+            SELECT * FROM signals 
+            WHERE potential_high IS NOT NULL 
+            AND potential_low IS NOT NULL
+        """
+        return pd.read_sql_query(query, self.db)
+    
+    def simulate_trade(self, signal: pd.Series, params: dict) -> dict:
+        """
+        Symuluje pojedynczy trade z danymi parametrami.
+        
+        Logika:
+        1. Sprawdź czy sygnał przechodzi filtry (min_confidence, min_liquidity, etc.)
+        2. Jeśli tak, symuluj wejście po price_at_signal
+        3. Sprawdź czy potential_low < entry * (1 - stop_loss) → SL triggered
+        4. Sprawdź czy potential_high > entry * (1 + take_profit) → TP triggered
+        5. Jeśli oba możliwe, użyj heurystyki czasowej lub assume worse case
+        6. Oblicz PnL
+        """
+        entry_price = signal['price_at_signal']
+        potential_high = signal['potential_high']
+        potential_low = signal['potential_low']
+        
+        # Filtry wejścia
+        if signal['confidence_score'] < params['min_confidence']:
+            return {'action': 'skip', 'reason': 'low_confidence', 'pnl': 0}
+        if signal['liquidity_usd'] < params['min_liquidity']:
+            return {'action': 'skip', 'reason': 'low_liquidity', 'pnl': 0}
+        if signal['mcap_usd'] > params['max_mcap']:
+            return {'action': 'skip', 'reason': 'high_mcap', 'pnl': 0}
+            
+        # Symulacja outcome
+        sl_price = entry_price * (1 - params['stop_loss'])
+        tp1_price = entry_price * (1 + params['take_profit_1'])
+        tp2_price = entry_price * (1 + params['take_profit_2'])
+        
+        sl_hit = potential_low <= sl_price
+        tp1_hit = potential_high >= tp1_price
+        tp2_hit = potential_high >= tp2_price
+        
+        # Determine outcome (simplified - assume SL checked first)
+        if sl_hit and not tp1_hit:
+            pnl = -params['stop_loss'] * 100
+            exit_reason = 'sl'
+        elif tp2_hit:
+            pnl = params['take_profit_2'] * 100
+            exit_reason = 'tp2'
+        elif tp1_hit:
+            pnl = params['take_profit_1'] * 100
+            exit_reason = 'tp1'
+        else:
+            # Neither hit - use price_after_1h
+            price_1h = signal.get('price_after_1h', entry_price)
+            pnl = ((price_1h - entry_price) / entry_price) * 100
+            exit_reason = 'timeout'
+            
+        return {
+            'action': 'buy',
+            'pnl': pnl,
+            'exit_reason': exit_reason,
+            'position_size': params['position_size_base']
+        }
+    
+    def run_backtest(self, params: dict) -> dict:
+        """
+        Uruchamia pełny backtest z danymi parametrami.
+        Zwraca metryki performance.
+        """
+        signals = self.load_signals()
+        results = []
+        
+        for _, signal in signals.iterrows():
+            result = self.simulate_trade(signal, params)
+            results.append(result)
+            
+        # Calculate metrics
+        trades = [r for r in results if r['action'] == 'buy']
+        
+        if not trades:
+            return {'total_pnl': 0, 'win_rate': 0, 'sharpe': 0}
+            
+        pnls = [t['pnl'] for t in trades]
+        wins = [p for p in pnls if p > 0]
+        
+        return {
+            'total_pnl': sum(pnls),
+            'avg_pnl': np.mean(pnls),
+            'win_rate': len(wins) / len(trades) * 100,
+            'max_drawdown': min(pnls),
+            'num_trades': len(trades),
+            'sharpe': np.mean(pnls) / (np.std(pnls) + 1e-8)
+        }
+```
+
+### 2.4 Optuna Optimizer
+
+**Lokalizacja:** `ml/optimizer.py`
+
+```python
+import optuna
+from optuna.visualization import plot_optimization_history, plot_param_importances
+
+class StrategyOptimizer:
+    """
+    Jesse-style optimizer using Optuna.
+    Znajduje optymalne parametry strategii na podstawie historycznych danych.
+    """
+    
+    def __init__(self, db_path: str, redis_url: str):
+        self.backtester = ReplayBacktester(db_path)
+        self.redis = redis.from_url(redis_url)
+        self.study = None
+        
+    def objective(self, trial: optuna.Trial) -> float:
+        """Funkcja celu dla Optuna"""
+        
+        params = {
+            'stop_loss': trial.suggest_float('stop_loss', 0.05, 0.35),
+            'take_profit_1': trial.suggest_float('take_profit_1', 0.15, 0.50),
+            'take_profit_2': trial.suggest_float('take_profit_2', 0.40, 1.50),
+            'trailing_activate': trial.suggest_float('trailing_activate', 0.20, 0.60),
+            'trailing_distance': trial.suggest_float('trailing_distance', 0.08, 0.25),
+            'min_confidence': trial.suggest_float('min_confidence', 0.40, 0.85),
+            'min_liquidity': trial.suggest_float('min_liquidity', 500, 10000),
+            'max_mcap': trial.suggest_float('max_mcap', 100000, 5000000),
+            'position_size_base': trial.suggest_float('position_size_base', 5.0, 30.0),
+            'whale_trust_threshold': trial.suggest_float('whale_trust_threshold', 0.3, 0.7),
+        }
+        
+        # Run backtest
+        metrics = self.backtester.run_backtest(params)
+        
+        # Multi-objective: maximize PnL while maintaining good win rate
+        # Penalize low win rate
+        score = metrics['total_pnl']
+        if metrics['win_rate'] < 40:
+            score *= 0.5  # Penalty for low win rate
+        if metrics['num_trades'] < 10:
+            score *= 0.3  # Penalty for too few trades
+            
+        return score
+    
+    def optimize(self, n_trials: int = 200, study_name: str = "monad_strategy"):
+        """Uruchamia optymalizację"""
+        
+        self.study = optuna.create_study(
+            study_name=study_name,
+            direction='maximize',
+            sampler=optuna.samplers.TPESampler(seed=42),
+            pruner=optuna.pruners.MedianPruner()
+        )
+        
+        self.study.optimize(
+            self.objective,
+            n_trials=n_trials,
+            show_progress_bar=True
+        )
+        
+        return self.study.best_params, self.study.best_value
+    
+    def save_best_params(self):
+        """Zapisuje najlepsze parametry do Redis"""
+        if not self.study:
+            raise ValueError("Run optimize() first")
+            
+        params = self.study.best_params
+        
+        # Save to Redis
+        self.redis.hset("ml:params:current", mapping={
+            k: str(v) for k, v in params.items()
+        })
+        self.redis.set("ml:params:version", f"v{int(time.time())}")
+        
+        # Also save to file as backup
+        with open("ml/params/best_params.json", "w") as f:
+            json.dump(params, f, indent=2)
+            
+        return params
+    
+    def generate_report(self, output_dir: str = "ml/reports"):
+        """Generuje raport z optymalizacji"""
+        if not self.study:
+            return
+            
+        # Optimization history
+        fig1 = plot_optimization_history(self.study)
+        fig1.write_html(f"{output_dir}/optimization_history.html")
+        
+        # Parameter importance
+        fig2 = plot_param_importances(self.study)
+        fig2.write_html(f"{output_dir}/param_importance.html")
+        
+        # Best trial details
+        best = self.study.best_trial
+        report = {
+            'best_value': best.value,
+            'best_params': best.params,
+            'n_trials': len(self.study.trials),
+            'datetime': datetime.now().isoformat()
+        }
+        
+        with open(f"{output_dir}/optimization_report.json", "w") as f:
+            json.dump(report, f, indent=2)
+```
+
+### 2.5 Integracja z Botem (Parameter Loader)
+
+**Lokalizacja:** `agents/config.py` (modyfikacja)
+
+```python
+class DynamicConfig:
+    """
+    Ładuje parametry z Redis (ustawione przez Optimizer).
+    Fallback do domyślnych wartości jeśli Redis niedostępny.
+    """
+    
+    DEFAULTS = {
+        'stop_loss': 0.25,
+        'take_profit_1': 0.30,
+        'take_profit_2': 0.60,
+        'trailing_activate': 0.40,
+        'trailing_distance': 0.15,
+        'min_confidence': 0.50,
+        'min_liquidity': 1000,
+        'max_mcap': 1000000,
+        'position_size_base': 10.0,
+        'whale_trust_threshold': 0.5,
+    }
+    
+    def __init__(self, redis_url: str):
+        self.redis = redis.from_url(redis_url)
+        self._cache = {}
+        self._cache_time = 0
+        self._cache_ttl = 60  # Refresh co 60s
+        
+    def get(self, key: str) -> float:
+        """Pobiera parametr z cache/Redis/default"""
+        self._refresh_cache_if_needed()
+        return self._cache.get(key, self.DEFAULTS.get(key))
+    
+    def _refresh_cache_if_needed(self):
+        if time.time() - self._cache_time > self._cache_ttl:
+            try:
+                params = self.redis.hgetall("ml:params:current")
+                self._cache = {k: float(v) for k, v in params.items()}
+                self._cache_time = time.time()
+            except:
+                pass  # Use existing cache or defaults
+```
+
+---
+
+## Komponent 3: ML Trade Classifier (XGBoost → ONNX → Rust)
+
+### 3.1 Feature Engineering
+
+**Input Features (12):**
+
+| # | Feature | Normalizacja | Opis |
+|---|---------|--------------|------|
+| 1 | `mcap_norm` | log10(mcap) / 8 | Market cap (log scale) |
+| 2 | `volume_norm` | log10(volume) / 7 | Volume 24h (log scale) |
+| 3 | `liquidity_norm` | log10(liq) / 6 | Liquidity (log scale) |
+| 4 | `holders_norm` | log10(holders) / 5 | Holder count |
+| 5 | `price_change_1h` | (change + 100) / 200 | Clipped [-100, +100] |
+| 6 | `price_change_24h` | (change + 200) / 400 | Clipped [-200, +200] |
+| 7 | `whale_amount_norm` | min(amount / 500, 1) | Whale buy size |
+| 8 | `whale_trust` | trust_score | 0-1 |
+| 9 | `sentiment` | (score + 1) / 2 | -1 to +1 → 0 to 1 |
+| 10 | `is_whale_copy` | 1/0 | Trigger type |
+| 11 | `is_snipe` | 1/0 | Trigger type |
+| 12 | `hour_of_day` | hour / 24 | Time feature |
+
+**Label:** `1` jeśli `pnl_percent > 10`, else `0`
+
+### 3.2 Training Pipeline
+
+**Lokalizacja:** `ml/train_classifier.py`
+
+```python
+import xgboost as xgb
+from sklearn.model_selection import cross_val_score, train_test_split
+from skl2onnx import convert_sklearn
+import onnx
+
+class TradeClassifierTrainer:
+    """Trenuje XGBoost classifier do przewidywania sukcesu trade'u"""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.model = None
+        self.feature_columns = [
+            'mcap_norm', 'volume_norm', 'liquidity_norm', 'holders_norm',
+            'price_change_1h', 'price_change_24h', 'whale_amount_norm',
+            'whale_trust', 'sentiment', 'is_whale_copy', 'is_snipe', 'hour_of_day'
+        ]
+        
+    def load_and_prepare_data(self) -> tuple:
+        """Ładuje dane i przygotowuje features"""
+        conn = sqlite3.connect(self.db_path)
+        
+        df = pd.read_sql_query("""
+            SELECT * FROM signals 
+            WHERE action_taken = 'buy' 
+            AND pnl_percent IS NOT NULL
+        """, conn)
+        
+        # Feature engineering
+        df['mcap_norm'] = np.log10(df['mcap_usd'].clip(1)) / 8
+        df['volume_norm'] = np.log10(df['volume_24h'].clip(1)) / 7
+        df['liquidity_norm'] = np.log10(df['liquidity_usd'].clip(1)) / 6
+        df['holders_norm'] = np.log10(df['holders'].clip(1)) / 5
+        df['price_change_1h'] = (df['price_change_1h'].clip(-100, 100) + 100) / 200
+        df['price_change_24h'] = (df['price_change_24h'].clip(-200, 200) + 200) / 400
+        df['whale_amount_norm'] = (df['whale_amount_mon'] / 500).clip(0, 1)
+        df['whale_trust'] = df['whale_trust_score'].fillna(0.5)
+        df['sentiment'] = (df['sentiment_score'].fillna(0) + 1) / 2
+        df['is_whale_copy'] = (df['trigger_type'] == 'whale_copy').astype(int)
+        df['is_snipe'] = (df['trigger_type'] == 'snipe').astype(int)
+        df['hour_of_day'] = pd.to_datetime(df['timestamp'], unit='s').dt.hour / 24
+        
+        # Label
+        df['label'] = (df['pnl_percent'] > 10).astype(int)
+        
+        X = df[self.feature_columns].values
+        y = df['label'].values
+        
+        return X, y
+    
+    def train(self, X, y) -> dict:
+        """Trenuje model z cross-validation"""
+        
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        self.model = xgb.XGBClassifier(
+            n_estimators=100,
+            max_depth=5,
+            learning_rate=0.1,
+            objective='binary:logistic',
+            eval_metric='auc',
+            use_label_encoder=False
+        )
+        
+        # Cross-validation
+        cv_scores = cross_val_score(self.model, X_train, y_train, cv=5, scoring='roc_auc')
+        
+        # Final training
+        self.model.fit(X_train, y_train)
+        
+        # Test evaluation
+        y_pred = self.model.predict(X_test)
+        y_prob = self.model.predict_proba(X_test)[:, 1]
+        
+        return {
+            'cv_auc_mean': cv_scores.mean(),
+            'cv_auc_std': cv_scores.std(),
+            'test_accuracy': (y_pred == y_test).mean(),
+            'feature_importance': dict(zip(self.feature_columns, self.model.feature_importances_))
+        }
+    
+    def export_onnx(self, output_path: str = "ml/models/trade_classifier.onnx"):
+        """Eksportuje model do ONNX dla Rust"""
+        from skl2onnx.common.data_types import FloatTensorType
+        
+        initial_type = [('features', FloatTensorType([None, len(self.feature_columns)]))]
+        
+        onnx_model = convert_sklearn(
+            self.model,
+            initial_types=initial_type,
+            target_opset=12
+        )
+        
+        onnx.save_model(onnx_model, output_path)
+        return output_path
+```
+
+### 3.3 Rust ONNX Inference
+
+**Lokalizacja:** `src/ml_inference.rs`
+
+```rust
+use ort::{Environment, Session, Value, tensor::OrtOwnedTensor};
+use std::sync::Arc;
+
+pub struct TradeClassifier {
+    session: Session,
+}
+
+impl TradeClassifier {
+    pub fn new(model_path: &str) -> Result<Self, ort::Error> {
+        let environment = Arc::new(Environment::builder().build()?);
+        
+        let session = Session::builder()?
+            .with_optimization_level(ort::GraphOptimizationLevel::Level3)?
+            .with_intra_threads(1)?
+            .with_model_from_file(model_path)?;
+            
+        Ok(Self { session })
+    }
+    
+    pub fn predict(&self, features: &[f32; 12]) -> Result<f32, ort::Error> {
+        let input_array = ndarray::Array::from_shape_vec(
+            (1, 12),
+            features.to_vec()
+        ).unwrap();
+        
+        let inputs = vec![Value::from_array(input_array)?];
+        let outputs = self.session.run(inputs)?;
+        
+        // Output is probability of success
+        let probs: OrtOwnedTensor<f32, _> = outputs[1].try_extract()?;
+        let probability = probs.view()[[0, 1]];  // Class 1 probability
+        
+        Ok(probability)
+    }
+}
+
+// Integration with copy_trader.rs
+impl CopyTrader {
+    async fn should_execute_trade(&self, signal: &WhaleSignal) -> bool {
+        let features = self.build_features(signal).await;
+        
+        match self.classifier.predict(&features) {
+            Ok(prob) if prob >= 0.6 => {
+                println!("ML Classifier: {:.1}% confidence - EXECUTING", prob * 100.0);
+                true
+            }
+            Ok(prob) => {
+                println!("ML Classifier: {:.1}% confidence - SKIPPING", prob * 100.0);
+                false
+            }
+            Err(e) => {
+                println!("ML Error: {}, falling back to rules", e);
+                self.rule_based_decision(signal)
+            }
+        }
+    }
+}
+```
+
+**Cargo.toml (dodatki):**
+
+```toml
+[dependencies]
+ort = { version = "2.0", features = ["load-dynamic"] }
+ndarray = "0.15"
+```
+
+---
+
+## Komponent 4: NLP Sentiment Service
+
+### 4.1 Architektura Mikroserwisu
+
+```mermaid
+graph LR
+    subgraph "Data Sources"
+        TW[Twitter API v2]
+        TG[Telegram Groups]
+    end
+    
+    subgraph "Sentiment Service :8081"
+        COL[Collectors]
+        MODEL[DistilBERT]
+        AGG[Aggregator]
+    end
+    
+    subgraph "Storage"
+        RD[(DragonflyDB)]
+    end
+    
+    TW --> COL
+    TG --> COL
+    COL --> MODEL
+    MODEL --> AGG
+    AGG --> RD
+```
+
+### 4.2 Model Setup
+
+**Base Model:** `distilbert-base-uncased-finetuned-sst-2-english`
+**Fine-tuning Dataset:** Crypto Twitter sentiment (opcjonalnie)
+
+**Lokalizacja:** `services/sentiment/model.py`
+
+```python
+from transformers import pipeline, AutoModelForSequenceClassification, AutoTokenizer
+
+class CryptoSentimentModel:
+    """Wrapper dla modelu sentiment analysis"""
+    
+    def __init__(self, model_name: str = "distilbert-base-uncased-finetuned-sst-2-english"):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        self.pipe = pipeline(
+            "sentiment-analysis",
+            model=self.model,
+            tokenizer=self.tokenizer,
+            device=-1  # CPU, use 0 for GPU
+        )
+        
+    def analyze(self, text: str) -> float:
+        """
+        Zwraca score od -1.0 (bearish) do +1.0 (bullish)
+        """
+        result = self.pipe(text[:512])[0]  # Truncate to 512 tokens
+        
+        label = result['label']
+        score = result['score']
+        
+        if label == 'POSITIVE':
+            return score
+        else:
+            return -score
+            
+    def analyze_batch(self, texts: list) -> list:
+        """Batch processing dla wydajności"""
+        results = self.pipe([t[:512] for t in texts])
+        
+        scores = []
+        for r in results:
+            if r['label'] == 'POSITIVE':
+                scores.append(r['score'])
+            else:
+                scores.append(-r['score'])
+                
+        return scores
+```
+
+### 4.3 FastAPI Service
+
+**Lokalizacja:** `services/sentiment/main.py`
+
+```python
+from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel
+import redis.asyncio as redis
+import asyncio
+
+app = FastAPI(title="Crypto Sentiment Service")
+
+# Global instances
+sentiment_model = None
+redis_client = None
+
+class TextInput(BaseModel):
+    text: str
+    token: str  # Token address or symbol
+
+class SentimentResponse(BaseModel):
+    token: str
+    score: float
+    aggregated_score: float
+
+@app.on_event("startup")
+async def startup():
+    global sentiment_model, redis_client
+    sentiment_model = CryptoSentimentModel()
+    redis_client = await redis.from_url(
+        "rediss://default:***@612ehcb9i.dragonflydb.cloud:6385"
+    )
+
+@app.post("/analyze", response_model=SentimentResponse)
+async def analyze_text(input: TextInput):
+    """Analizuje tekst i aktualizuje agregowany sentiment dla tokena"""
+    
+    # Analyze
+    score = sentiment_model.analyze(input.text)
+    
+    # Update aggregated score in Redis
+    key = f"ml:sentiment:{input.token}:scores"
+    await redis_client.lpush(key, score)
+    await redis_client.ltrim(key, 0, 99)  # Keep last 100
+    
+    # Calculate aggregated (weighted recent)
+    scores = await redis_client.lrange(key, 0, -1)
+    scores = [float(s) for s in scores]
+    
+    # Weighted average (recent scores count more)
+    weights = [1.0 / (i + 1) for i in range(len(scores))]
+    aggregated = sum(s * w for s, w in zip(scores, weights)) / sum(weights)
+    
+    # Store aggregated
+    await redis_client.setex(
+        f"ml:sentiment:{input.token}:score",
+        3600,  # 1h TTL
+        str(aggregated)
+    )
+    
+    return SentimentResponse(
+        token=input.token,
+        score=score,
+        aggregated_score=aggregated
+    )
+
+@app.get("/sentiment/{token}")
+async def get_sentiment(token: str) -> dict:
+    """Pobiera aktualny sentiment dla tokena"""
+    score = await redis_client.get(f"ml:sentiment:{token}:score")
+    return {"token": token, "sentiment": float(score) if score else 0.0}
+```
+
+### 4.4 Twitter Collector
+
+**Lokalizacja:** `services/sentiment/twitter_collector.py`
+
+```python
+import tweepy
+import asyncio
+import aiohttp
+
+class TwitterCollector:
+    """Zbiera tweety o tokenach i wysyła do analizy"""
+    
+    def __init__(self, bearer_token: str, sentiment_api: str):
+        self.client = tweepy.Client(bearer_token=bearer_token)
+        self.sentiment_api = sentiment_api
+        self.tracked_tokens = set()
+        
+    async def search_token_mentions(self, token_symbol: str, token_address: str):
+        """Szuka wzmianek o tokenie"""
+        query = f"${token_symbol} OR {token_address[:10]} -is:retweet lang:en"
+        
+        tweets = self.client.search_recent_tweets(
+            query=query,
+            max_results=20,
+            tweet_fields=['created_at', 'public_metrics']
+        )
+        
+        if not tweets.data:
+            return
+            
+        async with aiohttp.ClientSession() as session:
+            for tweet in tweets.data:
+                await session.post(
+                    f"{self.sentiment_api}/analyze",
+                    json={"text": tweet.text, "token": token_address}
+                )
+                
+    async def run_collector_loop(self, interval: int = 60):
+        """Główna pętla zbierająca"""
+        while True:
+            for token in list(self.tracked_tokens):
+                try:
+                    await self.search_token_mentions(token['symbol'], token['address'])
+                except Exception as e:
+                    print(f"Twitter error: {e}")
+                    
+            await asyncio.sleep(interval)
+```
+
+### 4.5 Telegram Collector
+
+**Lokalizacja:** `services/sentiment/telegram_collector.py`
+
+```python
+from telegram import Update
+from telegram.ext import Application, MessageHandler, filters
+
+class TelegramCollector:
+    """Nasłuchuje na grupach Telegram i analizuje wiadomości"""
+    
+    def __init__(self, bot_token: str, sentiment_api: str, groups: list):
+        self.app = Application.builder().token(bot_token).build()
+        self.sentiment_api = sentiment_api
+        self.groups = groups
+        
+        self.app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message)
+        )
+        
+    async def handle_message(self, update: Update, context):
+        """Przetwarza wiadomość z grupy"""
+        message = update.message
+        
+        if not message or message.chat_id not in self.groups:
+            return
+            
+        text = message.text
+        
+        # Extract token mentions (simple pattern)
+        import re
+        tokens = re.findall(r'\$([A-Z]{2,10})', text)
+        addresses = re.findall(r'0x[a-fA-F0-9]{40}', text)
+        
+        async with aiohttp.ClientSession() as session:
+            for token in tokens + addresses:
+                await session.post(
+                    f"{self.sentiment_api}/analyze",
+                    json={"text": text, "token": token}
+                )
+                
+    def run(self):
+        """Uruchamia bota"""
+        self.app.run_polling()
+```
+
+---
+
+## Komponent 5: Integracja z DragonflyDB
+
+### 5.1 Konfiguracja
+
+**Lokalizacja:** `config/redis_config.py`
+
+```python
+DRAGONFLY_CONFIG = {
+    "url": "rediss://default:***@612ehcb9i.dragonflydb.cloud:6385",
+    "decode_responses": True,
+    "socket_timeout": 5,
+    "socket_connect_timeout": 5,
+    "retry_on_timeout": True,
+    "health_check_interval": 30,
+}
+
+# Key prefixes
+KEYS = {
+    "params": "ml:params:",           # Optimized parameters
+    "sentiment": "ml:sentiment:",      # Token sentiment scores
+    "features": "ml:features:",        # Cached features
+    "model_version": "ml:model:",      # Model versions
+    "whale_trust": "ml:whale:",        # Whale trust scores
+}
+```
+
+### 5.2 Feature Store
+
+**Lokalizacja:** `ml/feature_store.py`
+
+```python
+class FeatureStore:
+    """Centralny cache dla ML features"""
+    
+    def __init__(self, redis_url: str):
+        self.redis = redis.from_url(redis_url)
+        
+    async def get_trading_features(self, token: str, whale: str = None) -> dict:
+        """Pobiera wszystkie features potrzebne do predykcji"""
+        
+        pipe = self.redis.pipeline()
+        pipe.get(f"ml:sentiment:{token}:score")
+        if whale:
+            pipe.get(f"ml:whale:{whale}:trust")
+        pipe.hgetall(f"ml:features:{token}:current")
+        
+        results = await pipe.execute()
+        
+        return {
+            "sentiment_score": float(results[0]) if results[0] else 0.0,
+            "whale_trust": float(results[1]) if whale and results[1] else 0.5,
+            **{k: float(v) for k, v in (results[-1] or {}).items()}
+        }
+        
+    async def cache_features(self, token: str, features: dict, ttl: int = 300):
+        """Cache'uje features z TTL"""
+        await self.redis.hset(
+            f"ml:features:{token}:current",
+            mapping={k: str(v) for k, v in features.items()}
+        )
+        await self.redis.expire(f"ml:features:{token}:current", ttl)
+```
+
+---
+
+## Komponent 6: Struktura Plików (Finalna)
+
+```
+monad_engine/
+├── ml/
+│   ├── __init__.py
+│   ├── data_collector.py        # Enhanced signal logging
+│   ├── outcome_tracker.py       # Background price tracker
+│   ├── backtest_engine.py       # Replay-based backtester
+│   ├── optimizer.py             # Optuna strategy optimizer
+│   ├── train_classifier.py      # XGBoost training
+│   ├── feature_store.py         # Redis feature cache
+│   ├── models/
+│   │   ├── trade_classifier.onnx
+│   │   └── .gitkeep
+│   ├── params/
+│   │   ├── best_params.json
+│   │   └── .gitkeep
+│   └── reports/
+│       └── .gitkeep
+├── services/
+│   ├── sentiment/
+│   │   ├── __init__.py
+│   │   ├── main.py              # FastAPI service
+│   │   ├── model.py             # DistilBERT wrapper
+│   │   ├── twitter_collector.py
+│   │   └── telegram_collector.py
+│   └── docker-compose.yml
+├── src/
+│   ├── bin/
+│   │   ├── copy_trader.rs       # +ML inference
+│   │   └── mempool_sniper.rs    # +ML inference
+│   └── ml_inference.rs          # ONNX wrapper
+├── agents/
+│   ├── config.py                # +DynamicConfig
+│   └── smart_agent.py           # +ML integration
+├── config/
+│   └── redis_config.py
+└── scripts/
+    ├── run_optimizer.py         # CLI for optimization
+    ├── train_models.py          # CLI for training
+    └── collect_data.py          # Start data collection
+```
+
+---
+
+## Komponent 7: Wymagane Zależności
+
+### Python (requirements.txt - dodatki)
+
+```
+# ML Core
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+xgboost>=2.0.0
+onnx>=1.14.0
+skl2onnx>=1.15.0
+
+# Optimization
+optuna>=3.4.0
+optuna-dashboard>=0.14.0
+
+# NLP
+transformers>=4.35.0
+torch>=2.1.0
+
+# API
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.5.0
+
+# Data Sources
+tweepy>=4.14.0
+python-telegram-bot>=20.6
+
+# Redis
+redis>=5.0.0
+hiredis>=2.3.0
+
+# Visualization
+plotly>=5.18.0
+```
+
+### Rust (Cargo.toml - dodatki)
+
+```toml
+[dependencies]
+ort = { version = "2.0", features = ["load-dynamic"] }
+ndarray = "0.15"
+redis = { version = "0.24", features = ["tokio-comp", "tls-rustls"] }
+```
+
+---
+
+## Workflow Operacyjny
+
+### Faza 1: Zbieranie Danych (Teraz → ~100 trade'ów)
+
+```bash
+# 1. Uruchom bota z enhanced logging
+python scripts/collect_data.py
+
+# 2. Bot działa normalnie, ale loguje WSZYSTKO do ml_training.db
+# 3. Outcome tracker śledzi ceny po sygnałach
+```
+
+### Faza 2: Pierwsza Optymalizacja (Po ~100 trade'ach)
+
+```bash
+# 1. Uruchom Optuna optimizer
+python scripts/run_optimizer.py --trials 200
+
+# 2. Sprawdź wyniki
+optuna-dashboard sqlite:///ml/optuna_studies.db
+
+# 3. Zoptymalizowane parametry automatycznie w Redis
+```
+
+### Faza 3: Training ML Classifier
+
+```bash
+# 1. Trenuj model
+python scripts/train_models.py --type classifier
+
+# 2. Model ONNX w ml/models/trade_classifier.onnx
+# 3. Rebuild Rust z nowym modelem
+cargo build --release --bin copy_trader
+```
+
+### Faza 4: NLP Service
+
+```bash
+# 1. Uruchom sentiment service
+cd services/sentiment
+uvicorn main:app --host 0.0.0.0 --port 8081
+
+# 2. Uruchom collectory (osobne procesy)
+python twitter_collector.py &
+python telegram_collector.py &
+```
+
+---
+
+## Monitoring i Metryki
+
+### Redis Keys do Monitorowania
+
+```
+ml:params:version          → Aktualna wersja parametrów
+ml:params:current          → Hash z parametrami
+ml:model:classifier:version → Wersja modelu ML
+ml:sentiment:{token}:score → Sentiment score tokena
+ml:stats:trades_today      → Liczba trade'ów dziś
+ml:stats:pnl_today         → PnL dziś
+```
+
+### Alerty
+
+```python
+# W smart_agent.py lub osobnym monitoring agent
+if daily_pnl < -100:  # -100 MON
+    send_telegram_alert("Daily loss exceeded 100 MON, pausing bot")
+    
+if model_accuracy < 0.5:  # Po 50 trade'ach
+    send_telegram_alert("Model accuracy dropped, retrain needed")
+```

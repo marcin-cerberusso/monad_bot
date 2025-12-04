@@ -1,0 +1,564 @@
+# Pełny System ML dla Autonomicznego Bota Tradingowego
+
+## Przegląd
+
+Implementacja 3-poziomowego systemu Machine Learning z architekturą hybrydową:
+- **Training:** Python (sklearn, torch, stable-baselines3)
+- **Inference:** Rust (ONNX Runtime)
+- **Cache/Features:** DragonflyDB (Redis-compatible)
+- **Storage:** SQLite (historia) + JSONL (logi)
+
+```mermaid
+graph TB
+    subgraph "Data Sources"
+        TW[Twitter API]
+        TG[Telegram]
+        WH[Whale Transactions]
+        MK[Market Data]
+    end
+    
+    subgraph "Data Collection Layer"
+        DC[Data Collector<br/>Python]
+        DB[(SQLite<br/>agent_memory.db)]
+        RD[(DragonflyDB<br/>Real-time Cache)]
+    end
+    
+    subgraph "ML Training Pipeline"
+        TR1[XGBoost Classifier<br/>trade_classifier.py]
+        TR2[PPO Agent<br/>rl_position.py]
+        TR3[DistilBERT<br/>sentiment_model.py]
+        ONNX[ONNX Export]
+    end
+    
+    subgraph "Inference Layer"
+        RS[Rust Bot<br/>copy_trader.rs]
+        PY[Python Agent<br/>smart_agent.py]
+        NLP[NLP Service<br/>sentiment_service.py]
+    end
+    
+    TW --> DC
+    TG --> DC
+    WH --> DC
+    MK --> DC
+    
+    DC --> DB
+    DC --> RD
+    
+    DB --> TR1
+    DB --> TR2
+    DB --> TR3
+    
+    TR1 --> ONNX
+    TR2 --> ONNX
+    TR3 --> ONNX
+    
+    ONNX --> RS
+    ONNX --> PY
+    
+    RD --> RS
+    RD --> PY
+    NLP --> RD
+```
+
+---
+
+## Komponent 1: Pipeline Zbierania Danych
+
+### 1.1 Struktura Danych do Treningu
+
+**Lokalizacja:** `ml/data_collector.py`
+
+Każdy trade musi zawierać pełny kontekst rynkowy:
+
+| Feature | Typ | Źródło | Opis |
+|---------|-----|--------|------|
+| `token_address` | string | trade | Adres tokena |
+| `mcap_usd` | float | DexScreener | Market cap w momencie wejścia |
+| `volume_24h` | float | DexScreener | Wolumen 24h |
+| `liquidity_usd` | float | DexScreener | Płynność |
+| `holders` | int | Chain | Liczba holderów |
+| `price_change_1h` | float | DexScreener | Zmiana ceny 1h |
+| `price_change_24h` | float | DexScreener | Zmiana ceny 24h |
+| `whale_address` | string | trade | Adres whale'a (jeśli copy trade) |
+| `whale_amount_mon` | float | trade | Kwota whale'a |
+| `whale_trust_score` | float | LTM | Historyczny trust score |
+| `sentiment_score` | float | NLP | Sentyment z Twittera/TG |
+| `entry_price` | float | trade | Cena wejścia |
+| `exit_price` | float | trade | Cena wyjścia |
+| `pnl_percent` | float | trade | Wynik procentowy |
+| `hold_time_seconds` | int | trade | Czas trzymania |
+| `exit_reason` | string | trade | tp1/tp2/sl/manual |
+| `label` | int | computed | 1=sukces (>10%), 0=porażka |
+
+### 1.2 Schemat SQLite
+
+**Lokalizacja:** `data/ml_training.db`
+
+```sql
+CREATE TABLE training_samples (
+    id INTEGER PRIMARY KEY,
+    timestamp REAL,
+    token_address TEXT,
+    mcap_usd REAL,
+    volume_24h REAL,
+    liquidity_usd REAL,
+    holders INTEGER,
+    price_change_1h REAL,
+    price_change_24h REAL,
+    whale_address TEXT,
+    whale_amount_mon REAL,
+    whale_trust_score REAL,
+    sentiment_score REAL,
+    entry_price REAL,
+    exit_price REAL,
+    pnl_percent REAL,
+    hold_time_seconds INTEGER,
+    exit_reason TEXT,
+    label INTEGER,
+    features_vector BLOB
+);
+
+CREATE INDEX idx_timestamp ON training_samples(timestamp);
+CREATE INDEX idx_label ON training_samples(label);
+```
+
+### 1.3 Real-time Features w DragonflyDB
+
+**Klucze Redis:**
+
+```
+ml:features:{token}:current     -> JSON z aktualnymi features
+ml:sentiment:{token}:score      -> float sentiment score
+ml:whale:{address}:trust        -> float trust score
+ml:model:classifier:version     -> string wersja modelu
+ml:model:rl:version             -> string wersja modelu RL
+```
+
+**TTL:** 5 minut dla features, 1 godzina dla sentiment, brak TTL dla trust scores.
+
+---
+
+## Komponent 2: Klasyfikator Sukcesu Trade'u (Poziom 1)
+
+### 2.1 Architektura Modelu
+
+**Model:** XGBoost Classifier
+**Input:** 12 features (znormalizowane 0-1)
+**Output:** Prawdopodobieństwo sukcesu (0.0 - 1.0)
+**Threshold:** >= 0.6 = BUY, < 0.4 = SKIP, między = HOLD
+
+### 2.2 Training Pipeline
+
+**Lokalizacja:** `ml/train_classifier.py`
+
+```python
+# Pseudo-kod struktury
+class TradeClassifierTrainer:
+    def __init__(self, db_path: str, redis_url: str):
+        self.db = sqlite3.connect(db_path)
+        self.redis = redis.from_url(redis_url)
+    
+    def load_data(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Ładuje dane z SQLite, normalizuje features"""
+        
+    def train(self) -> xgb.XGBClassifier:
+        """Trenuje model z cross-validation"""
+        
+    def export_onnx(self, model, path: str):
+        """Eksportuje do ONNX dla Rust"""
+        
+    def upload_to_redis(self, model_path: str):
+        """Aktualizuje wersję modelu w Redis"""
+```
+
+### 2.3 ONNX Export
+
+**Lokalizacja:** `ml/models/trade_classifier.onnx`
+
+```python
+from skl2onnx import convert_sklearn
+from skl2onnx.common.data_types import FloatTensorType
+
+initial_type = [('features', FloatTensorType([None, 12]))]
+onnx_model = convert_sklearn(xgb_model, initial_types=initial_type)
+```
+
+### 2.4 Rust Inference
+
+**Lokalizacja:** `src/bin/copy_trader.rs` (rozszerzenie)
+
+```rust
+use ort::{Session, Value};
+
+struct MLClassifier {
+    session: Session,
+}
+
+impl MLClassifier {
+    fn new(model_path: &str) -> Result<Self> {
+        let session = Session::builder()?
+            .with_model_from_file(model_path)?;
+        Ok(Self { session })
+    }
+    
+    fn predict(&self, features: &[f32; 12]) -> f32 {
+        let input = Value::from_array(features)?;
+        let outputs = self.session.run(vec![input])?;
+        outputs[0].extract_tensor::<f32>()?[0]
+    }
+}
+```
+
+**Cargo.toml (dodatki):**
+```toml
+[dependencies]
+ort = "2.0"  # ONNX Runtime for Rust
+```
+
+---
+
+## Komponent 3: Reinforcement Learning dla TP/SL (Poziom 2)
+
+### 3.1 Środowisko Backtestingowe
+
+**Lokalizacja:** `ml/envs/trading_env.py`
+
+```python
+class TradingEnvironment(gym.Env):
+    """
+    Observation Space: [
+        current_pnl,        # -1.0 to 2.0
+        hold_time_norm,     # 0.0 to 1.0 (max 1h)
+        price_momentum,     # -1.0 to 1.0
+        volume_spike,       # 0.0 to 1.0
+        whale_activity,     # 0.0 to 1.0
+    ]
+    
+    Action Space: Discrete(3)
+        0 = HOLD
+        1 = TAKE_PROFIT
+        2 = STOP_LOSS
+    
+    Reward:
+        - HOLD: -0.001 (koszt czasu)
+        - TP przy zysku: +pnl_percent * 0.1
+        - TP przy stracie: -0.5
+        - SL przy stracie: +0.1 (uniknięcie większej straty)
+        - SL przy zysku: -0.3 (przedwczesne wyjście)
+    """
+```
+
+### 3.2 Training z PPO
+
+**Lokalizacja:** `ml/train_rl.py`
+
+```python
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+def train_rl_agent(db_path: str, total_timesteps: int = 100_000):
+    env = DummyVecEnv([lambda: TradingEnvironment(db_path)])
+    
+    model = PPO(
+        "MlpPolicy",
+        env,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=10,
+        gamma=0.99,
+        verbose=1
+    )
+    
+    model.learn(total_timesteps=total_timesteps)
+    
+    # Export to ONNX
+    export_ppo_to_onnx(model, "ml/models/rl_position.onnx")
+```
+
+### 3.3 Integracja z Position Agent
+
+**Lokalizacja:** `agents/position_agent.py` (modyfikacja)
+
+Zamiast sztywnych TP1=30%, TP2=60%, SL=-25%:
+
+```python
+async def _check_exit_with_rl(self, position: dict) -> str:
+    """Używa modelu RL do decyzji o wyjściu"""
+    features = self._build_rl_features(position)
+    
+    # Query Redis for cached prediction or compute
+    action = await self.rl_model.predict(features)
+    
+    if action == 1:  # TAKE_PROFIT
+        return "rl_tp"
+    elif action == 2:  # STOP_LOSS
+        return "rl_sl"
+    return None  # HOLD
+```
+
+---
+
+## Komponent 4: NLP Sentiment Analysis (Poziom 3)
+
+### 4.1 Architektura Mikroserwisu
+
+```mermaid
+graph LR
+    TW[Twitter Stream] --> NLP[NLP Service<br/>Port 8081]
+    TG[Telegram Bot] --> NLP
+    NLP --> MODEL[DistilBERT]
+    MODEL --> SCORE[Sentiment Score]
+    SCORE --> RD[(DragonflyDB)]
+    RD --> BOT[Trading Bot]
+```
+
+### 4.2 Model NLP
+
+**Lokalizacja:** `ml/sentiment/model.py`
+
+**Base Model:** `distilbert-base-uncased`
+**Fine-tuning:** Crypto Twitter dataset (np. CryptoSentiment od Hugging Face)
+**Output:** Score -1.0 (bearish) do +1.0 (bullish)
+
+### 4.3 Sentiment Service
+
+**Lokalizacja:** `services/sentiment_service.py`
+
+```python
+from fastapi import FastAPI
+from transformers import pipeline
+import redis.asyncio as redis
+
+app = FastAPI()
+sentiment_pipe = pipeline("sentiment-analysis", model="./models/crypto_sentiment")
+redis_client = redis.from_url("rediss://...")
+
+@app.post("/analyze")
+async def analyze_text(text: str, token: str):
+    result = sentiment_pipe(text)[0]
+    score = result['score'] if result['label'] == 'POSITIVE' else -result['score']
+    
+    # Aggregate z poprzednimi
+    key = f"ml:sentiment:{token}:scores"
+    await redis_client.lpush(key, score)
+    await redis_client.ltrim(key, 0, 99)  # Keep last 100
+    
+    # Oblicz średnią
+    scores = await redis_client.lrange(key, 0, -1)
+    avg_score = sum(float(s) for s in scores) / len(scores)
+    
+    await redis_client.set(f"ml:sentiment:{token}:score", avg_score, ex=3600)
+    return {"token": token, "sentiment": avg_score}
+```
+
+### 4.4 Integratory Danych
+
+**Twitter Collector:** `services/twitter_collector.py`
+- Używa Twitter API v2 (Bearer Token)
+- Streamuje tweety z hashtagami: $TOKEN, #crypto, cashtags
+- Wysyła do `/analyze` endpoint
+
+**Telegram Collector:** `services/telegram_collector.py`
+- Bot nasłuchuje na grupach (np. Monad Alpha, NAD.FUN)
+- Filtruje wiadomości o tokenach
+- Wysyła do `/analyze` endpoint
+
+---
+
+## Komponent 5: Integracja z DragonflyDB
+
+### 5.1 Konfiguracja Połączenia
+
+**Lokalizacja:** `config/redis_config.py`
+
+```python
+DRAGONFLY_CONFIG = {
+    "url": "rediss://default:***@612ehcb9i.dragonflydb.cloud:6385",
+    "decode_responses": True,
+    "socket_timeout": 5,
+    "retry_on_timeout": True,
+}
+```
+
+### 5.2 Feature Store
+
+**Lokalizacja:** `ml/feature_store.py`
+
+```python
+class FeatureStore:
+    """Centralne repozytorium features dla ML"""
+    
+    async def get_features(self, token: str) -> dict:
+        """Pobiera wszystkie features dla tokena"""
+        pipe = self.redis.pipeline()
+        pipe.get(f"ml:features:{token}:current")
+        pipe.get(f"ml:sentiment:{token}:score")
+        pipe.get(f"ml:whale:{whale}:trust")
+        results = await pipe.execute()
+        return self._merge_features(results)
+    
+    async def update_features(self, token: str, features: dict):
+        """Aktualizuje features z TTL"""
+        await self.redis.setex(
+            f"ml:features:{token}:current",
+            300,  # 5 min TTL
+            json.dumps(features)
+        )
+```
+
+### 5.3 Model Versioning
+
+**Lokalizacja:** `ml/model_registry.py`
+
+```python
+class ModelRegistry:
+    """Zarządzanie wersjami modeli"""
+    
+    async def get_current_version(self, model_name: str) -> str:
+        return await self.redis.get(f"ml:model:{model_name}:version")
+    
+    async def register_model(self, model_name: str, version: str, path: str):
+        await self.redis.hset(f"ml:model:{model_name}:meta", mapping={
+            "version": version,
+            "path": path,
+            "timestamp": time.time()
+        })
+        await self.redis.set(f"ml:model:{model_name}:version", version)
+```
+
+---
+
+## Komponent 6: Struktura Plików
+
+```
+monad_engine/
+├── ml/
+│   ├── __init__.py
+│   ├── data_collector.py       # Zbieranie danych treningowych
+│   ├── feature_store.py        # Redis feature store
+│   ├── model_registry.py       # Wersjonowanie modeli
+│   ├── train_classifier.py     # Training XGBoost
+│   ├── train_rl.py             # Training PPO
+│   ├── envs/
+│   │   ├── __init__.py
+│   │   └── trading_env.py      # Gym environment dla RL
+│   ├── sentiment/
+│   │   ├── __init__.py
+│   │   ├── model.py            # DistilBERT wrapper
+│   │   └── train_sentiment.py  # Fine-tuning
+│   └── models/
+│       ├── trade_classifier.onnx
+│       ├── rl_position.onnx
+│       └── crypto_sentiment/    # HuggingFace model dir
+├── services/
+│   ├── __init__.py
+│   ├── sentiment_service.py    # FastAPI NLP service
+│   ├── twitter_collector.py    # Twitter stream
+│   └── telegram_collector.py   # Telegram listener
+├── src/bin/
+│   ├── copy_trader.rs          # +ONNX inference
+│   └── mempool_sniper.rs       # +ONNX inference
+└── config/
+    └── redis_config.py         # DragonflyDB config
+```
+
+---
+
+## Komponent 7: Wymagane Zależności
+
+### Python (requirements.txt - dodatki)
+
+```
+# ML Core
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+xgboost>=2.0.0
+onnx>=1.14.0
+skl2onnx>=1.15.0
+
+# Reinforcement Learning
+stable-baselines3>=2.1.0
+gymnasium>=0.29.0
+
+# NLP
+transformers>=4.35.0
+torch>=2.1.0
+datasets>=2.14.0
+
+# Services
+fastapi>=0.104.0
+uvicorn>=0.24.0
+tweepy>=4.14.0
+python-telegram-bot>=20.6
+
+# Redis
+redis>=5.0.0
+hiredis>=2.3.0
+```
+
+### Rust (Cargo.toml - dodatki)
+
+```toml
+[dependencies]
+ort = "2.0"                    # ONNX Runtime
+redis = { version = "0.24", features = ["tokio-comp", "tls-rustls"] }
+```
+
+---
+
+## Komponent 8: Przepływ Decyzyjny (Docelowy)
+
+```mermaid
+sequenceDiagram
+    participant WH as Whale TX
+    participant RS as Rust Bot
+    participant RD as DragonflyDB
+    participant ML as ML Models
+    
+    WH->>RS: Nowa transakcja whale'a
+    RS->>RD: Pobierz features (token, whale)
+    RD-->>RS: {mcap, volume, sentiment, trust...}
+    
+    RS->>ML: Classifier.predict(features)
+    ML-->>RS: probability = 0.78
+    
+    alt probability >= 0.6
+        RS->>RS: EXECUTE BUY
+        RS->>RD: Zapisz pozycję
+        
+        loop Position Monitoring
+            RS->>RD: Pobierz aktualne dane
+            RS->>ML: RL.predict(position_state)
+            ML-->>RS: action = HOLD/TP/SL
+            
+            alt action == TP or SL
+                RS->>RS: EXECUTE SELL
+                RS->>RD: Zapisz wynik (dla treningu)
+            end
+        end
+    else probability < 0.4
+        RS->>RS: SKIP
+    else 0.4 <= probability < 0.6
+        RS->>RS: HOLD (czekaj na więcej danych)
+    end
+```
+
+---
+
+## Uwagi Implementacyjne
+
+1. **Cold Start:** Bez danych historycznych, pierwszy model będzie słaby. Zalecam:
+   - Uruchomienie bota w trybie "paper trading" przez pierwszy okres
+   - Zbieranie minimum 500 sampli przed pierwszym treningiem
+
+2. **Retraining:** Automatyczny cron job (np. co 24h) do:
+   - Pobrania nowych danych z SQLite
+   - Retreningu modeli
+   - Eksportu do ONNX
+   - Aktualizacji wersji w Redis
+
+3. **Fallback:** Jeśli model ONNX nie załaduje się, bot wraca do rule-based logic z `ai_agent.py`
+
+4. **Monitoring:** Logowanie prediction vs actual outcome do analizy drift'u modelu

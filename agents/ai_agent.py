@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 
 from .base_agent import BaseAgent, Message, MessageTypes, Channels
 from . import decision_logger
-from . import config
 
 load_dotenv()
 
@@ -79,27 +78,28 @@ class AIAgent(BaseAgent):
     
     def _build_prompt(self, data: dict) -> str:
         """Build AI prompt"""
-        return f"""You are a crypto trading analyst. Analyze this token opportunity:
+        return f"""You are a crypto trading analyst on NAD.FUN (Monad blockchain meme platform).
 
 Token: {data['token']}
-Whale bought: {data['amount_mon']:.1f} MON
-Tax/Slippage: {data.get('tax_percent', 0):.1f}%
-Liquidity: ${data.get('liquidity_usd', 0):.0f}
-1h Pump: {data.get('pump_1h', 0):.1f}%
+Whale bought: {data['amount_mon']:.1f} MON (this is a TRUSTED signal!)
 
-Rules:
+Key info:
+- A whale just bought this token for {data['amount_mon']:.1f} MON
+- Whale buys > 500 MON are very bullish signals
+- We follow whales because they have insider info
+- NAD.FUN is new, no liquidity data available - IGNORE liquidity
+
+Trading Rules:
 - Max 20 MON per trade
-- Skip if tax > 15%
-- Skip if already pumped > 100%
-- Higher liquidity = safer
-- Whale following works best on fresh tokens
+- Follow whale if amount > 200 MON
+- Bigger whale = more confidence
 
-Respond in JSON:
+Respond ONLY with JSON (no other text):
 {{
   "action": "BUY" or "SKIP",
   "confidence": 0-100,
-  "amount_mon": 5-20 (if BUY),
-  "reason": "explanation"
+  "amount_mon": 5-20,
+  "reason": "brief explanation"
 }}"""
     
     async def _get_ai_decision(self, prompt: str) -> Optional[Dict]:
@@ -158,38 +158,32 @@ Respond in JSON:
         return None
     
     def _rule_based_decision(self, data: dict) -> Dict:
-        """Fallback rule-based decision"""
-        tax = data.get("tax_percent", 100)
-        liq = data.get("liquidity_usd", 0)
-        pump = data.get("pump_1h", 0)
+        """Fallback rule-based decision - trust whales on NAD.FUN"""
         whale_size = data.get("amount_mon", 0)
         
-        # Skip conditions
-        if tax > 15:
-            return {"action": "SKIP", "confidence": 90, "reason": f"Tax too high: {tax:.1f}%"}
-        if liq < 1000:
-            return {"action": "SKIP", "confidence": 85, "reason": f"Low liquidity: ${liq:.0f}"}
-        if pump > 100:
-            return {"action": "SKIP", "confidence": 80, "reason": f"Already pumped: +{pump:.0f}%"}
+        # Simple whale-trust logic - no DexScreener data needed
+        if whale_size < 200:
+            return {"action": "SKIP", "confidence": 70, "reason": f"Whale too small: {whale_size:.0f} MON"}
         
-        # Calculate amount based on conditions
-        confidence = 70
-        amount = 10
-        
-        if whale_size > 500:
-            confidence += 10
-            amount = 15
-        if liq > 10000:
-            confidence += 10
+        # Calculate amount based on whale size
+        if whale_size >= 1000:
+            confidence = 85
             amount = 20
-        if tax < 5:
-            confidence += 5
+            reason = f"Big whale: {whale_size:.0f} MON - strong signal!"
+        elif whale_size >= 500:
+            confidence = 75
+            amount = 15
+            reason = f"Medium whale: {whale_size:.0f} MON - good signal"
+        else:
+            confidence = 65
+            amount = 10
+            reason = f"Small whale: {whale_size:.0f} MON - cautious entry"
         
         return {
             "action": "BUY",
-            "confidence": min(confidence, 95),
-            "amount_mon": min(amount, 20),
-            "reason": f"Whale {whale_size:.0f} MON, liq ${liq:.0f}, tax {tax:.1f}%"
+            "confidence": confidence,
+            "amount_mon": amount,
+            "reason": reason
         }
 
 

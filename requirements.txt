@@ -3,3 +3,5 @@ python-dotenv
 aiohttp
 websockets
 redis
+optuna
+pandas

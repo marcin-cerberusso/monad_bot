@@ -11,7 +11,6 @@ from typing import Dict, Optional
 from dotenv import load_dotenv
 
 from .base_agent import BaseAgent, Message, MessageTypes, Channels
-from . import config
 
 load_dotenv()
 
@@ -20,14 +19,12 @@ RPC_URL = os.getenv("MONAD_RPC_URL")
 CAST_PATH = os.path.expanduser("~/.foundry/bin/cast")
 POSITIONS_FILE = Path(__file__).resolve().parent.parent / "positions.json"
 
-# TP/SL settings from central config
-TP1_PERCENT = config.TP1_PERCENT
-TP1_SELL = config.TP1_SELL_PERCENT
-TP2_PERCENT = config.TP2_PERCENT
-TP2_SELL = config.TP2_SELL_PERCENT
-STOP_LOSS = config.STOP_LOSS_PERCENT
-TRAILING_ACTIVATE = config.TRAILING_ACTIVATE
-TRAILING_STOP = config.TRAILING_STOP
+# TP/SL settings
+TP1_PERCENT = 30   # Take 30% profit at +30%
+TP2_PERCENT = 60   # Take 40% more at +60%
+STOP_LOSS = -25    # Stop loss at -25%
+TRAILING_ACTIVATE = 40  # Activate trailing at +40%
+TRAILING_STOP = 15  # Trail by 15%
 
 
 class PositionAgent(BaseAgent):
@@ -53,13 +50,6 @@ class PositionAgent(BaseAgent):
         """Handle position updates"""
         if message.type == MessageTypes.TRADE_EXECUTED:
             self.log(f"Trade executed: {message.data.get('action')} {message.data.get('token', '')[:12]}...")
-        
-        # === WHALE SELL - natychmiast sprzedaj pozycję! ===
-        elif message.type == MessageTypes.WHALE_SELL:
-            token = message.data.get("token", "").lower()
-            whale = message.data.get("whale", "")[:10]
-            self.log(f"🔴 WHALE EXIT: {whale}... selling {token[:12]} - following!")
-            await self._emergency_sell_token(token, reason="whale_exit")
     
     async def _check_positions(self):
         """Check all positions for TP/SL"""
@@ -115,7 +105,7 @@ class PositionAgent(BaseAgent):
         # TP1 (not taken yet)
         elif pnl_percent >= TP1_PERCENT and not pos.get("tp1_taken"):
             action = "sell"
-            percent_to_sell = TP1_SELL
+            percent_to_sell = 30
             reason = f"TP1 at +{pnl_percent:.1f}%"
             pos["tp1_taken"] = True
             self._save_position(token, pos)
@@ -123,7 +113,7 @@ class PositionAgent(BaseAgent):
         # TP2 (not taken yet)
         elif pnl_percent >= TP2_PERCENT and not pos.get("tp2_taken"):
             action = "sell"
-            percent_to_sell = TP2_SELL
+            percent_to_sell = 40
             reason = f"TP2 at +{pnl_percent:.1f}%"
             pos["tp2_taken"] = True
             self._save_position(token, pos)
@@ -200,42 +190,6 @@ class PositionAgent(BaseAgent):
                 json.dump(positions, f, indent=2)
         except:
             pass
-    
-    async def _emergency_sell_token(self, token: str, reason: str = "whale_exit"):
-        """Natychmiastowa sprzedaż tokena - whale exit!"""
-        positions = self._load_positions()
-        token_lower = token.lower()
-        
-        if token_lower not in positions:
-            self.log(f"  No position in {token[:12]} to sell")
-            return
-        
-        pos = positions[token_lower]
-        self.log(f"🚨 EMERGENCY SELL: {token[:12]}... (reason: {reason})")
-        
-        # Wyślij SELL_ORDER do TraderAgent
-        await self.publish(Channels.TRADER, Message(
-            type=MessageTypes.SELL_ORDER,
-            data={
-                "token": token,
-                "sell_percent": 100,  # Sprzedaj wszystko!
-                "reason": reason,
-                "position": pos
-            },
-            sender=self.name
-        ))
-        
-        # Usuń pozycję
-        del positions[token_lower]
-        with open(POSITIONS_FILE, "w") as f:
-            json.dump(positions, f, indent=2)
-        
-        # Notify
-        await self.notify(
-            "🚨 WHALE EXIT - Sold!",
-            f"Following whale - sold 100% of {token[:16]}",
-            0xFF0000  # Red
-        )
 
 
 if __name__ == "__main__":
