@@ -33,20 +33,20 @@ def setup_logging(name: str = "monad_bot") -> logging.Logger:
     
     # Formatter
     formatter = logging.Formatter(
-        '%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s'
+        '%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    # Console handler (INFO and above) - with immediate flush
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    console_handler.stream.reconfigure(line_buffering=True) if hasattr(console_handler.stream, 'reconfigure') else None
-    logger.addHandler(console_handler)
+    # Console handler (INFO and above)
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(formatter)
+    logger.addHandler(console)
     
-    # Main file handler with rotation (10MB max, 5 backups)
-    main_log_path = LOG_DIR / f"{name}.log"
+    # File handler (DEBUG and above, rotating)
+    log_path = LOG_DIR / f"{name}.log"
     file_handler = RotatingFileHandler(
-        main_log_path,
+        log_path,
         maxBytes=10 * 1024 * 1024,  # 10MB
         backupCount=5,
         encoding='utf-8'
@@ -75,6 +75,7 @@ MIN_WHALE_BUY_MON = float(os.getenv("MIN_WHALE_BUY_MON", "200"))  # Only follow 
 
 # === POSITION SIZING ===
 FOLLOW_AMOUNT_MON = float(os.getenv("FOLLOW_AMOUNT_MON", "8"))   # 8 MON per trade
+DEFAULT_TRADE_SIZE = FOLLOW_AMOUNT_MON  # Alias for TraderAgent
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))              # Max 5 open positions
 
 # === TAKE PROFIT ===
