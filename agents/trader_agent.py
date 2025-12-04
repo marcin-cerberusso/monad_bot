@@ -176,6 +176,7 @@ class TraderAgent(BaseAgent):
         percent = data.get("percent", 100)
         pnl_percent = data.get("pnl_percent", 0)
         whale = data.get("whale", "")
+        amount_mon = data.get("amount_mon", 10)  # Get from position data
         
         self.log(f"💸 Selling {percent}% of {token[:12]}...")
         
@@ -187,7 +188,13 @@ class TraderAgent(BaseAgent):
             # 🧠 MEMORY: Record trade result for learning
             entry_price = 1.0  # We track MON value, not price
             exit_price = 1.0 + (pnl_percent / 100)
-            self.smart.record_trade_result(token, entry_price, exit_price)
+            self.smart.record_trade_result(
+                token=token, 
+                entry_price=entry_price, 
+                exit_price=exit_price,
+                amount_mon=amount_mon,
+                trigger_type="whale_copy"
+            )
             
             # 🧠 MEMORY: Update whale profile
             if whale:
