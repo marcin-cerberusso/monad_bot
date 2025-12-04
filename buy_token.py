@@ -1,18 +1,52 @@
 #!/usr/bin/env python3
 """
-🛒 BUY TOKEN - Wykonuje zakup tokena przez NAD.FUN Router
+🛒 BUY TOKEN - Wykonuje zakup tokena przez NAD.FUN Router (pure web3.py)
 
 Usage: python3 buy_token.py <token_address> <amount_mon>
 """
 
-import json
-import subprocess
 import sys
 import time
 from pathlib import Path
 from decimal import Decimal
+from web3 import Web3
+from eth_account import Account
 
 BASE_DIR = Path(__file__).parent
+
+# NAD.FUN Router ABI (only buy function)
+ROUTER_ABI = [
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"name": "token", "type": "address"},
+                    {"name": "amountOutMin", "type": "uint256"},
+                    {"name": "to", "type": "address"},
+                    {"name": "deadline", "type": "uint256"}
+                ],
+                "name": "params",
+                "type": "tuple"
+            }
+        ],
+        "name": "buy",
+        "outputs": [{"name": "amountOut", "type": "uint256"}],
+        "stateMutability": "payable",
+        "type": "function"
+    }
+]
+
+# ERC20 ABI for balance check
+ERC20_ABI = [
+    {
+        "constant": True,
+        "inputs": [{"name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function"
+    }
+]
+
 
 def load_env():
     """Load .env file"""
@@ -27,25 +61,6 @@ def load_env():
     except:
         pass
     return env
-
-
-def get_live_quote(token: str, amount_mon: float, rpc_url: str) -> tuple:
-    """Get live quote from NAD.FUN Lens for expected tokens out"""
-    lens = "0x7e78A8DE94f21804F7a17F4E8BF9EC2c872187ea"
-    amount_wei = int(Decimal(str(amount_mon)) * Decimal(10**18))
-    
-    # getTokenBuyQuote(address token, uint256 monAmount)
-    cmd = f'cast call {lens} "getTokenBuyQuote(address,uint256)" {token} {amount_wei} --rpc-url {rpc_url}'
-    
-    try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
-        if result.returncode == 0 and result.stdout.strip():
-            tokens_out = int(result.stdout.strip(), 16)
-            return tokens_out, None
-    except Exception as e:
-        return 0, str(e)
-    
-    return 0, "Failed to get quote"
 
 
 def main():
@@ -73,73 +88,77 @@ def main():
         print("ERROR: Missing PRIVATE_KEY or MONAD_RPC_URL in .env")
         sys.exit(1)
     
+    # Connect to Monad
+    w3 = Web3(Web3.HTTPProvider(rpc))
+    if not w3.is_connected():
+        print("ERROR: Cannot connect to Monad RPC")
+        sys.exit(1)
+    
     # NAD.FUN Router
-    router = "0x6F6B8F1a20703309951a5127c45B49b1CD981A22"
+    router_addr = "0x6F6B8F1a20703309951a5127c45B49b1CD981A22"
+    router = w3.eth.contract(address=Web3.to_checksum_address(router_addr), abi=ROUTER_ABI)
     
     print(f"🛒 Buying token: {token}")
     print(f"   Amount: {amount_mon} MON")
-    print(f"   Router: {router}")
+    print(f"   Router: {router_addr}")
     
-    # 1. Get live quote
-    print("\n📊 Getting quote...")
-    expected_tokens, err = get_live_quote(token, amount_mon, rpc)
-    if err:
-        print(f"⚠️ Quote error (continuing anyway): {err}")
-        expected_tokens = 0
-    else:
-        print(f"   Expected tokens: {expected_tokens}")
-    
-    # 2. Calculate minimum out with slippage (5%)
-    slippage = 0.05
-    min_tokens_out = int(expected_tokens * (1 - slippage)) if expected_tokens > 0 else 1
-    
-    # 3. Prepare buy call
+    # Calculate amounts
     amount_wei = int(Decimal(str(amount_mon)) * Decimal(10**18))
     deadline = int(time.time()) + 300  # 5 minutes
     
-    # buy((address token, uint256 amountOutMin, address to, uint256 deadline)) payable
-    # The value is sent as MON
-    buy_params = f"({token},{min_tokens_out},{wallet},{deadline})"
+    # Min tokens out = 1 (trust whales, they already validated)
+    min_tokens_out = 1
     
-    cmd_buy = (
-        f'cast send {router} '
-        f'"buy((address,uint256,address,uint256))" '
-        f'"{buy_params}" '
-        f'--value {amount_wei} '
-        f'--private-key {pk} '
-        f'--rpc-url {rpc} '
-        f'--gas-limit 500000'
-    )
+    # Prepare buy params
+    token_checksum = Web3.to_checksum_address(token)
+    wallet_checksum = Web3.to_checksum_address(wallet)
+    
+    buy_params = (token_checksum, min_tokens_out, wallet_checksum, deadline)
     
     print(f"\n🚀 Executing buy...")
     print(f"   Min tokens out: {min_tokens_out}")
     print(f"   Deadline: {deadline}")
     
-    result = subprocess.run(cmd_buy, shell=True, capture_output=True, text=True, timeout=60)
-    
-    if result.returncode != 0:
+    try:
+        # Build transaction
+        account = Account.from_key(pk)
+        nonce = w3.eth.get_transaction_count(account.address)
+        
+        tx = router.functions.buy(buy_params).build_transaction({
+            'from': account.address,
+            'value': amount_wei,
+            'gas': 500000,
+            'gasPrice': w3.eth.gas_price,
+            'nonce': nonce,
+            'chainId': w3.eth.chain_id
+        })
+        
+        # Sign and send
+        signed_tx = w3.eth.account.sign_transaction(tx, pk)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        
+        print(f"   TX sent: {tx_hash.hex()}")
+        
+        # Wait for receipt
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        
+        if receipt['status'] == 1:
+            print(f"\n✅ BUY SUCCESS!")
+            print(f"   TX: {tx_hash.hex()}")
+            print(f"   Gas used: {receipt['gasUsed']}")
+            
+            # Check token balance
+            token_contract = w3.eth.contract(address=token_checksum, abi=ERC20_ABI)
+            balance = token_contract.functions.balanceOf(wallet_checksum).call()
+            print(f"   Token balance: {balance}")
+        else:
+            print(f"\n❌ TX reverted!")
+            sys.exit(1)
+            
+    except Exception as e:
         print(f"\n❌ Buy failed!")
-        print(f"   Error: {result.stderr[:500]}")
+        print(f"   Error: {str(e)[:500]}")
         sys.exit(1)
-    
-    print(f"\n✅ BUY SUCCESS!")
-    
-    # Parse tx hash from output
-    if "transactionHash" in result.stdout or "0x" in result.stdout:
-        lines = result.stdout.strip().split('\n')
-        for line in lines:
-            if "transactionHash" in line or (line.startswith("0x") and len(line) == 66):
-                print(f"   TX: {line.strip()[:70]}")
-                break
-    
-    # 4. Verify balance
-    print("\n📊 Checking balance...")
-    cmd_bal = f'cast call {token} "balanceOf(address)" {wallet} --rpc-url {rpc}'
-    result = subprocess.run(cmd_bal, shell=True, capture_output=True, text=True, timeout=10)
-    
-    if result.returncode == 0 and result.stdout.strip():
-        balance = int(result.stdout.strip(), 16)
-        print(f"   Token balance: {balance}")
     
     print("\n✅ Done!")
 
