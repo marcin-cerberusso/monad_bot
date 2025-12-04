@@ -191,10 +191,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-        sys.exit(1)
-    
-    print("\n✅ Done!")
-
-
-if __name__ == "__main__":
-    main()
