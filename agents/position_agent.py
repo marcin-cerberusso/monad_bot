@@ -2,21 +2,18 @@
 📊 POSITION AGENT - Zarządza pozycjami (TP/SL/Trailing)
 """
 import asyncio
-import os
 import json
-import subprocess
-from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional
-from dotenv import load_dotenv
+from pathlib import Path
+from typing import Optional
 
-from .base_agent import BaseAgent, Message, MessageTypes, Channels
+from .base_agent import BaseAgent, Message, MessageType
+from . import config
 
-load_dotenv()
 
 LENS = "0x7e78A8DE94f21804F7a17F4E8BF9EC2c872187ea"
-RPC_URL = os.getenv("MONAD_RPC_URL")
-CAST_PATH = os.path.expanduser("~/.foundry/bin/cast")
+RPC_URL = config.MONAD_RPC_URL
+CAST_PATH = config.CAST_PATH
 POSITIONS_FILE = Path(__file__).resolve().parent.parent / "positions.json"
 
 # TP/SL settings
@@ -52,144 +49,146 @@ class PositionAgent(BaseAgent):
             self.log(f"Trade executed: {message.data.get('action')} {message.data.get('token', '')[:12]}...")
     
     async def _check_positions(self):
-        """Check all positions for TP/SL"""
-        positions = self._load_positions()
-        
-        if not positions:
-            return
-        
-        self.log(f"Checking {len(positions)} positions...")
-        
-        for token, pos in list(positions.items()):
-            try:
-                await self._check_position(token, pos)
-            except Exception as e:
-                self.log(f"  Error checking {token[:12]}: {e}")
-    
-    async def _check_position(self, token: str, pos: dict):
-        """Check single position"""
-        entry_amount = pos.get("amount_mon", 0)
-        if entry_amount <= 0:
-            return
-        
-        # Get current value
-        current_value = await self._get_position_value(token)
-        if current_value is None:
-            return
-        
-        pnl_percent = ((current_value - entry_amount) / entry_amount) * 100
-        
-        # Update highest value for trailing
-        highest = pos.get("highest_value", entry_amount)
-        if current_value > highest:
-            highest = current_value
-            pos["highest_value"] = highest
-            self._save_position(token, pos)
-        
-        # Calculate drawdown from ATH
-        drawdown = ((highest - current_value) / highest) * 100 if highest > 0 else 0
-        
-        self.log(f"  {token[:12]}: PnL {pnl_percent:+.1f}% (ATH draw: -{drawdown:.1f}%)")
-        
-        # Check conditions
-        action = None
-        percent_to_sell = 0
-        reason = ""
-        
-        # Stop Loss
-        if pnl_percent <= STOP_LOSS:
-            action = "sell"
-            percent_to_sell = 100
-            reason = f"STOP LOSS at {pnl_percent:.1f}%"
-        
-        # TP1 (not taken yet)
-        elif pnl_percent >= TP1_PERCENT and not pos.get("tp1_taken"):
-            action = "sell"
-            percent_to_sell = 30
-            reason = f"TP1 at +{pnl_percent:.1f}%"
-            pos["tp1_taken"] = True
-            self._save_position(token, pos)
-        
-        # TP2 (not taken yet)
-        elif pnl_percent >= TP2_PERCENT and not pos.get("tp2_taken"):
-            action = "sell"
-            percent_to_sell = 40
-            reason = f"TP2 at +{pnl_percent:.1f}%"
-            pos["tp2_taken"] = True
-            self._save_position(token, pos)
-        
-        # Trailing stop
-        elif pnl_percent >= TRAILING_ACTIVATE:
-            if drawdown >= TRAILING_STOP:
-                action = "sell"
-                percent_to_sell = 100
-                reason = f"TRAILING STOP ({drawdown:.1f}% from ATH)"
-        
-        # Execute sell if needed
-        if action == "sell":
-            self.log(f"  🔔 {reason}")
-            await self.publish(Channels.TRADER, Message(
-                type=MessageTypes.SELL_ORDER,
-                data={
-                    "token": token,
-                    "percent": percent_to_sell,
-                    "reason": reason
-                },
-                sender=self.name
-            ))
-    
-    async def _get_position_value(self, token: str) -> Optional[float]:
-        """Get current position value in MON"""
+        """Check all positions for TP/SL triggers"""
         try:
-            # Get token balance
             positions = self._load_positions()
-            pos = positions.get(token.lower())
-            if not pos:
-                return None
+            if not positions:
+                return
+                
+            for token, pos in list(positions.items()):
+                try:
+                    # Get current price from NAD.FUN
+                    current_value = await self._get_token_value(token, pos.get('amount', 0))
+                    entry_value = pos.get('entry_value', pos.get('amount_mon', 0))
+                    
+                    if entry_value <= 0:
+                        continue
+                    
+                    # Calculate PnL
+                    pnl_percent = ((current_value - entry_value) / entry_value) * 100
+                    
+                    # Update position with current PnL
+                    pos['current_value'] = current_value
+                    pos['pnl_percent'] = pnl_percent
+                    pos['last_check'] = datetime.now().isoformat()
+                    
+                    # Track ATH for trailing stop
+                    if 'ath_value' not in pos or current_value > pos['ath_value']:
+                        pos['ath_value'] = current_value
+                    
+                    # Check triggers
+                    action = None
+                    sell_percent = 0
+                    reason = ""
+                    
+                    # 🔴 STOP LOSS
+                    if pnl_percent <= config.STOP_LOSS_PERCENT:
+                        action = "STOP_LOSS"
+                        sell_percent = 100
+                        reason = f"Stop Loss triggered at {pnl_percent:.1f}%"
+                        self.log(f"🔴 {token[:10]}... STOP LOSS: {pnl_percent:.1f}%")
+                    
+                    # 🟢 TAKE PROFIT 1 (30% of position at +50%)
+                    elif pnl_percent >= config.TP1_PERCENT and not pos.get('tp1_hit', False):
+                        action = "TP1"
+                        sell_percent = config.TP1_SELL_PERCENT
+                        reason = f"TP1 hit at {pnl_percent:.1f}%"
+                        pos['tp1_hit'] = True
+                        self.log(f"🟢 {token[:10]}... TP1: +{pnl_percent:.1f}% - selling {sell_percent}%")
+                    
+                    # 🟢 TAKE PROFIT 2 (40% of position at +100%)
+                    elif pnl_percent >= config.TP2_PERCENT and not pos.get('tp2_hit', False):
+                        action = "TP2"
+                        sell_percent = config.TP2_SELL_PERCENT
+                        reason = f"TP2 hit at {pnl_percent:.1f}%"
+                        pos['tp2_hit'] = True
+                        self.log(f"🟢 {token[:10]}... TP2: +{pnl_percent:.1f}% - selling {sell_percent}%")
+                    
+                    # 🟡 TRAILING STOP (if we're up 40%+ and drop 20% from ATH)
+                    elif pnl_percent >= 40:
+                        ath = pos.get('ath_value', current_value)
+                        drop_from_ath = ((ath - current_value) / ath) * 100 if ath > 0 else 0
+                        
+                        if drop_from_ath >= 20:
+                            action = "TRAILING_STOP"
+                            sell_percent = 100
+                            reason = f"Trailing stop: dropped {drop_from_ath:.1f}% from ATH"
+                            self.log(f"🟡 {token[:10]}... TRAILING STOP: -{drop_from_ath:.1f}% from ATH")
+                    
+                    # Execute sell if triggered
+                    if action and sell_percent > 0:
+                        await self.publish("monad:trader", Message(
+                            type=MessageType.SELL_ORDER,
+                            data={
+                                "token": token,
+                                "percent": sell_percent,
+                                "reason": reason,
+                                "action": action,
+                                "pnl_percent": pnl_percent
+                            },
+                            source="position_agent"
+                        ))
+                    
+                    # Save updated position
+                    self._save_positions(positions)
+                    
+                except Exception as e:
+                    self.log(f"Error checking position {token[:10]}...: {e}")
+                    
+        except Exception as e:
+            self.log(f"Error in _check_positions: {e}")
+    
+    async def _get_token_value(self, token: str, amount: float) -> float:
+        """Get current MON value of token holdings using NAD.FUN Lens"""
+        try:
+            import subprocess
             
-            # For simplicity, use entry amount * (1 + simulated change)
-            # In production, query actual balance and price
-            entry = pos.get("amount_mon", 0)
+            # NAD.FUN Lens contract for price queries
+            LENS = "0x7e78A8DE94f21804F7a17F4E8BF9EC2c872187ea"
+            RPC = "https://monad-mainnet.g.alchemy.com/v2/FPgsxxE5R86qHQ200z04i"
             
-            # Get sell quote from Lens
-            # This is a simplified version - in production query actual balance
-            amount_wei = int(entry * 1e18)
+            # Convert amount to wei (18 decimals)
+            amount_wei = int(amount * 10**18)
             
-            cmd = f'{CAST_PATH} call {LENS} "getAmountOut(address,uint256,bool)" {token} {amount_wei} false --rpc-url {RPC_URL}'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            # Call getAmountOut on Lens
+            result = subprocess.run([
+                "cast", "call", LENS,
+                f"getAmountOut(address,uint256,bool)(uint256)",
+                token, str(amount_wei), "true",  # true = selling tokens for MON
+                "--rpc-url", RPC
+            ], capture_output=True, text=True, timeout=10)
             
             if result.returncode == 0 and result.stdout.strip():
-                # Parse tuple output
-                output = result.stdout.strip()
-                # Extract second value (amount out)
-                if len(output) > 66:
-                    hex_val = output[-64:]
-                    return int(hex_val, 16) / 1e18
+                mon_wei = int(result.stdout.strip())
+                return mon_wei / 10**18
             
-            return entry  # Fallback to entry value
+            return 0
             
         except Exception as e:
-            return None
+            self.log(f"Error getting token value: {e}")
+            return 0
     
     def _load_positions(self) -> dict:
-        """Load positions"""
+        """Load positions from file"""
         try:
-            if POSITIONS_FILE.exists():
-                with open(POSITIONS_FILE) as f:
+            positions_file = Path("data/positions.json")
+            if positions_file.exists():
+                with open(positions_file) as f:
                     return json.load(f)
-        except:
-            pass
-        return {}
+            return {}
+        except Exception as e:
+            self.log(f"Error loading positions: {e}")
+            return {}
     
-    def _save_position(self, token: str, data: dict):
-        """Save position"""
+    def _save_positions(self, positions: dict):
+        """Save positions to file"""
         try:
-            positions = self._load_positions()
-            positions[token.lower()] = data
-            with open(POSITIONS_FILE, "w") as f:
-                json.dump(positions, f, indent=2)
-        except:
-            pass
+            positions_file = Path("data/positions.json")
+            positions_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(positions_file, 'w') as f:
+                json.dump(positions, f, indent=2, default=str)
+        except Exception as e:
+            self.log(f"Error saving positions: {e}")
 
 
 if __name__ == "__main__":

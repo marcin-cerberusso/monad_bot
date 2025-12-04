@@ -12,7 +12,8 @@ from dotenv import load_dotenv
 from web3 import Web3
 
 from .base_agent import BaseAgent, Message, MessageTypes, Channels
-from .notifications import notifier
+from .notifications import get_notifier
+
 from . import decision_logger
 from .smart_agent import SmartTradingAgent
 
@@ -57,195 +58,78 @@ class TraderAgent(BaseAgent):
     
     async def _execute_buy(self, data: dict):
         """Execute buy order"""
-        token = data["token"]
-        suggested_amount = data.get("suggested_amount", 10)
-        amount = min(suggested_amount, MAX_FOLLOW_SIZE)
+        token = data.get("token")
+        amount = data.get("amount", config.DEFAULT_TRADE_SIZE)
+        whale = data.get("whale", "unknown")
+        confidence = data.get("confidence", 0)
         
-        self.log(f"🛒 Buying {amount:.1f} MON of {token[:12]}...")
+        self.log(f"🛒 Buying {amount} MON of {token[:16]}...")
         
-        # 🧠 MEMORY: Final evaluation using SmartAgent  
-        recommendation = await self.smart.evaluate_trade(
-            token=token,
-            trigger_type="whale_copy",
-            whale_address=data.get("whale", ""),
-            whale_amount=data.get("amount_mon", 0),
-            token_data={
-                "mcap": data.get("mcap_usd", 0),
-                "liquidity": data.get("liquidity_usd", 0)
-            }
-        )
-        
-        if recommendation.action == 'skip' or recommendation.confidence < 0.3:
-            reasoning = "; ".join(recommendation.reasoning)[:60]
-            self.log(f"  🧠 SmartAgent BLOCKED: {recommendation.action} ({recommendation.confidence:.0%}) - {reasoning}")
-            self.smart.short_memory.remember('decision', {
-                'type': 'trade_blocked',
-                'token': token,
-                'reason': reasoning
-            }, importance=0.8)
-            return
-        
-        # Use SmartAgent's recommended amount
-        amount = min(recommendation.amount_mon, MAX_FOLLOW_SIZE)
-        self.log(f"  🧠 SmartAgent OK: {recommendation.action} ({recommendation.confidence:.0%}), amount: {amount:.1f} MON")
-        
-        # Check balance
-        balance = self._get_balance()
-        if balance < amount + 1:  # +1 for gas
-            self.log(f"  ❌ Insufficient balance: {balance:.2f} MON")
-            return
-        
-        # Check if already have position
-        positions = self._load_positions()
-        if token.lower() in positions:
-            self.log(f"  ⚠️ Already have position")
-            return
-        
-        # Execute buy
-        success, tx_hash = await self._buy(token, amount)
-        
-        if success:
-            self.trades_today += 1
-            
-            # 🧠 MEMORY: Track position
-            self.smart.open_position(
-                token=token, 
-                amount_mon=amount, 
-                entry_price=1.0,  # We track MON value
-                trigger_type="whale_copy",
-                whale_address=data.get("whale")
+        try:
+            # Execute buy
+            result = subprocess.run(
+                ["python3", "buy_token.py", token, str(amount)],
+                capture_output=True, text=True, timeout=60
             )
             
-            # Log for ML
-            decision_logger.log_trade(
-                token=token,
-                action="BUY",
-                amount_mon=amount,
-                tx_hash=tx_hash,
-                success=True,
-                whale_amount=data.get("amount_mon"),
-                ai_confidence=recommendation.confidence
-            )
-            
-            # Save position
-            position = {
-                "token": token,
-                "amount_mon": amount,
-                "entry_time": datetime.now().isoformat(),
-                "tx_hash": tx_hash,
-                "whale": data.get("whale", ""),
-                "ai_confidence": recommendation.confidence,
-                "smart_action": recommendation.action,
-                "liquidity_usd": data.get("liquidity_usd", 0)
-            }
-            self._save_position(token, position)
-            
-            self.log(f"  ✅ Bought! TX: {tx_hash[:16]}...")
-            
-            # Send notification
-            await notifier.send_alert(
-                "🟢 BUY EXECUTED",
-                f"**Token:** `{token}`\n**Amount:** `{amount} MON`\n**TX:** `{tx_hash}`",
-                0x00FF00
-            )
-            
-            # Notify position agent
-            await self.publish(Channels.POSITION, Message(
-                type=MessageTypes.TRADE_EXECUTED,
-                data={"action": "buy", **position},
-                sender=self.name
-            ))
-        else:
-            self.log(f"  ❌ Buy failed")
-            decision_logger.log_trade(
-                token=token,
-                action="BUY",
-                amount_mon=amount,
-                success=False,
-                error="Transaction failed"
-            )
-            await notifier.send_alert(
-                "🔴 BUY FAILED",
-                f"Failed to buy `{token}`",
-                0xFF0000
-            )
+            if result.returncode == 0:
+                self.log(f"✅ Buy successful!")
+                
+                # Send Telegram notification
+                notifier = get_notifier()
+                await notifier.notify_buy(token, amount, whale, confidence)
+                
+                # Save position
+                self._save_position(token, amount, whale)
+                
+                return True
+            else:
+                self.log(f"❌ Buy failed: {result.stderr}")
+                return False
+                
+        except Exception as e:
+            self.log(f"❌ Buy error: {e}")
+            await get_notifier().notify_error(str(e), f"Buy {token[:16]}")
+            return False
     
     async def _execute_sell(self, data: dict):
         """Execute sell order"""
-        token = data["token"]
+        token = data.get("token")
         percent = data.get("percent", 100)
-        pnl_percent = data.get("pnl_percent", 0)
-        whale = data.get("whale", "")
-        amount_mon = data.get("amount_mon", 10)  # Get from position data
+        reason = data.get("reason", "manual")
+        pnl = data.get("pnl_percent", 0)
+        action = data.get("action", "SELL")
         
-        self.log(f"💸 Selling {percent}% of {token[:12]}...")
+        self.log(f"💸 Selling {percent}% of {token[:16]}... ({reason})")
         
-        success, tx_hash = await self._sell(token, percent)
-        
-        if success:
-            self.log(f"  ✅ Sold! TX: {tx_hash[:16]}...")
-            
-            # 🧠 MEMORY: Record trade result for learning
-            entry_price = 1.0  # We track MON value, not price
-            exit_price = 1.0 + (pnl_percent / 100)
-            self.smart.record_trade_result(
-                token=token, 
-                entry_price=entry_price, 
-                exit_price=exit_price,
-                amount_mon=amount_mon,
-                trigger_type="whale_copy"
+        try:
+            # Execute sell
+            result = subprocess.run(
+                ["python3", "sell_token.py", token, str(percent)],
+                capture_output=True, text=True, timeout=60
             )
             
-            # 🧠 MEMORY: Update whale profile
-            if whale:
-                is_profit = pnl_percent > 0
-                self.smart.long_memory.record_trade(
-                    token=token,
-                    action="SELL",
-                    amount=0,  # We don't track sell amounts
-                    price=exit_price,
-                    whale_address=whale,
-                    success=is_profit
-                )
-                self.log(f"  🧠 Whale profile updated: {'✅ profit' if is_profit else '❌ loss'}")
-            
-            # 🧠 MEMORY: Learn lesson
-            if pnl_percent > 20:
-                self.smart.long_memory.learn_lesson(
-                    category="winning_trade",
-                    lesson=f"Token {token[:12]} gave {pnl_percent:.0f}% profit - whale signal worked",
-                    confidence=0.8
-                )
-            elif pnl_percent < -15:
-                self.smart.long_memory.learn_lesson(
-                    category="losing_trade", 
-                    lesson=f"Token {token[:12]} lost {abs(pnl_percent):.0f}% - entry was too late or bad whale",
-                    confidence=0.7
-                )
-            
-            # Send notification
-            await notifier.send_alert(
-                "🟢 SELL EXECUTED",
-                f"**Token:** `{token}`\n**Percent:** `{percent}%`\n**PnL:** `{pnl_percent:+.1f}%`\n**TX:** `{tx_hash}`",
-                0x00FF00 if pnl_percent > 0 else 0xFF6600
-            )
-            
-            if percent >= 100:
-                self._remove_position(token)
-            
-            await self.publish(Channels.POSITION, Message(
-                type=MessageTypes.TRADE_EXECUTED,
-                data={"action": "sell", "token": token, "percent": percent, "tx_hash": tx_hash, "pnl": pnl_percent},
-                sender=self.name
-            ))
-        else:
-            self.log(f"  ❌ Sell failed")
-            await notifier.send_alert(
-                "🔴 SELL FAILED",
-                f"Failed to sell `{token}`",
-                0xFF0000
-            )
-    
+            if result.returncode == 0:
+                self.log(f"✅ Sell successful!")
+                
+                # Send Telegram notification
+                notifier = get_notifier()
+                await notifier.notify_sell(token, percent, reason, pnl)
+                
+                # Update or remove position
+                if percent >= 100:
+                    self._remove_position(token)
+                
+                return True
+            else:
+                self.log(f"❌ Sell failed: {result.stderr}")
+                return False
+                
+        except Exception as e:
+            self.log(f"❌ Sell error: {e}")
+            await get_notifier().notify_error(str(e), f"Sell {token[:16]}")
+            return False
+
     async def _buy(self, token: str, amount_mon: float) -> tuple:
         """Execute buy via buy_token.py"""
         try:
